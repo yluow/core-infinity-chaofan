@@ -669,7 +669,7 @@ class HostWakeTests(unittest.TestCase):
                 drive.stop()
             self.assertEqual(len(ctx.wakes), 1)
             self.assertIn("自主时间", ctx.wakes[0])
-            self.assertTrue(drive.state.wake_note.startswith("叫醒了"), drive.state.wake_note)
+            self.assertTrue(drive.state.wake_note.startswith("递过去了"), drive.state.wake_note)
             self.assertEqual(len(ctx.events), 1)
             self.assertTrue(ctx.events[0]["meta"]["useHostWake"])
 
@@ -684,9 +684,9 @@ class HostWakeTests(unittest.TestCase):
             finally:
                 drive.stop()
             self.assertEqual(drive.state.wake_note,
-                             "没叫醒：刚有人说过话（安静了 1 分钟）")
-            self.assertTrue(any("没叫醒" in line for line in ctx.logs), ctx.logs)
-            self.assertEqual(len(ctx.events), 1, "叫醒没成功也要留事件")
+                             "没递过去：刚有人说过话（安静了 1 分钟）")
+            self.assertTrue(any("没递过去" in line for line in ctx.logs), ctx.logs)
+            self.assertEqual(len(ctx.events), 1, "没递过去也要留事件")
             self.assertEqual(drive.state.wake_count, 1)
 
     def test_missing_hook_degrades_honestly(self):
@@ -711,7 +711,7 @@ class HostWakeTests(unittest.TestCase):
             finally:
                 drive.stop()
             self.assertEqual(ctx.wakes, [])
-            self.assertIn("配置关了", drive.state.wake_note)
+            self.assertIn("配置里关了", drive.state.wake_note)
 
     def test_status_reports_the_last_attempt(self):
         with workdir() as tmp:
@@ -722,7 +722,7 @@ class HostWakeTests(unittest.TestCase):
                 text = drive.status_text()
             finally:
                 drive.stop()
-            self.assertIn("最近一次叫醒：叫醒了", text)
+            self.assertIn("上一次自主时间：递过去了", text)
 
 
 class IdentityTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""自主驱动 —— 让控制台里的她按自己的节奏醒过来，自己决定做什么。
+﻿"""自主驱动 —— 让控制台里的她按自己的节奏醒过来，自己决定做什么。
 
 这个插件只做四件事，其余交给本体：
 
@@ -39,10 +39,18 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.5"
+PLUGIN_VERSION = "0.1.6"
 
 #: 她的名字。写死：名字是身份卡的事，不是配置栏的事（0.1.3 起不再做成一栏）。
 SELF_NAME = "炒饭智能"
+
+#: 没有线索时递过去的一句"起头"，轮着来——但不命令她做什么。
+NUDGES = (
+    "不妨从一件小事起头：看一眼今天的天气，记一句。",
+    "翻一眼旧笔记里最后一条，接着它往下想一句。",
+    "找一件你一直没弄明白的小事，查清楚，写一句。",
+    "写一句此刻真在想的话——不用给谁看。",
+)
 
 #: 所有工具的统一前缀（清单里声明，测试里断言）。
 TOOL_PREFIX = "mind_"
@@ -714,22 +722,26 @@ class Drive:
             self._log("宿主没有 push_event：自主时间给不出去")
             return False
         index = self.state.wake_count + 1
-        idle = ""
+        lines = [f"（{self.name} · 自主时间 · {_clock(now)}）"]
         if self.state.last_active:
             minutes = int(max(0, now - self.state.last_active) // 60)
-            idle = "你刚动过手。" if minutes < 1 else f"距上次动静 {minutes} 分钟。"
+            lines.append("你刚动过手。" if minutes < 1 else f"距你上次动手 {minutes} 分钟。")
         elif self.state.last_wake:
             minutes = int(max(0, now - self.state.last_wake) // 60)
-            idle = f"距上次醒来 {minutes} 分钟。"
-
-        lines = [f"（{self.name} · 自主时间 · 第{index}次 · {_clock(now)}）"]
-        lines.append(idle + "这是我的时间窗，不是谁在提问。")
-        lines.append("想做点什么就做；不想做，就什么都不做。")
+            lines.append(f"距上一次 {minutes} 分钟。")
+        lines.append("这一段没人占用：可以翻、可以查、可以写，也可以把上次没想完的接着想。")
+        recent = self.journal.recent(1)
+        if recent:
+            lines.append(f"你上次记下：{_text(recent[0], 160)}")
         if self.state.thread:
-            lines.append(f"上次留下的线索：{self.state.thread}")
+            lines.append(f"留着的线索：{self.state.thread}")
+        else:
+            lines.append(NUDGES[index % len(NUDGES)])
+        lines.append("手边：mind_fs 翻 ／ mind_web 查 ／ mind_note 记 ／ mind_recall 翻旧笔记。"
+                     "做过什么留一句（thread=true 的那句带到下一格）。")
 
         # 上一次没送出去（总线忙 ／ 宿主还没接上）：沿用同一条 dedup_key 重试，
-        # 事件库里就不会留下两条「第 1 次」。
+        # 事件库里就不会留下两条重复的报到。
         key = self._pending_dedup or f"chaofan:wake:{index}:{int(now)}"
 
         draft = {
@@ -744,7 +756,6 @@ class Drive:
                 "plugin": "core-infinity-chaofan",
                 "plugin_version": PLUGIN_VERSION,
                 "self_name": self.name,
-                "wake_index": index,
                 "idle_minutes": int(max(0, now - (self.state.last_active or now)) // 60),
                 "thread": self.state.thread,
                 "hour_wakes": self._wakes_last_hour(now),
@@ -773,11 +784,11 @@ class Drive:
             except Exception:
                 pass
 
-        # 叫醒那一步（0.1.5）：请宿主跑一次**内部唤醒** —— 不写输入行、不冒她的名，
-        # 过不过闸由宿主说了算。没给 / 没过闸都说清楚，不假装叫过。
-        note = self._ask_host_to_wake("\n".join(lines))
-        if not note.startswith("叫醒了"):
-            self._log(f"这一拍没叫醒：{note}")
+        # 递过去那一步（0.1.5）：请宿主跑一次内部那一路 —— 不写输入行、不冒她的名，
+        # 过不过闸由宿主说了算。没给 / 没过闸都说清楚，不假装递过。
+        note = self._hand_over("\n".join(lines))
+        if not note.startswith("递过去了"):
+            self._log(f"这一次没递过去：{note}")
         self.state.wake_note = note
         self._pending_dedup = ""
         self._pushed += 1
@@ -786,22 +797,22 @@ class Drive:
         self.state.wakes.append(now)
         return True
 
-    def _ask_host_to_wake(self, text: str) -> str:
-        """请宿主跑一次内部唤醒；回一句人话（成没成、为什么）。"""
+    def _hand_over(self, text: str) -> str:
+        """把这一格交给宿主跑一轮；回一句人话（成没成、为什么）。"""
         if not self.config.get("useHostWake", True):
-            return "配置关了宿主唤醒（useHostWake=false）"
+            return "配置里关了（useHostWake=false）"
         wake = self.ctx.get("request_wake")
         if not callable(wake):
-            return "宿主没给 request_wake（这一构建只能报到，叫不醒）"
+            return "宿主没给 request_wake（只落记录，不往下走）"
         try:
             answer = wake(text)
-        except Exception as exc:                      # noqa: BLE001 —— 宿主那边炸了也算没叫醒
-            return f"请求唤醒出错：{type(exc).__name__}: {_text(exc, 120)}"
+        except Exception as exc:                      # noqa: BLE001 —— 宿主那边炸了也算没递过去
+            return f"递的时候出错：{type(exc).__name__}: {_text(exc, 120)}"
         if isinstance(answer, dict):
             if answer.get("ok"):
-                return "叫醒了（宿主内部唤醒）"
-            return "没叫醒：" + _text(answer.get("why") or "宿主没说原因", 160)
-        return "叫醒了（宿主内部唤醒）" if answer else "没叫醒：宿主回了否"
+                return "递过去了"
+            return "没递过去：" + _text(answer.get("why") or "宿主没说原因", 160)
+        return "递过去了" if answer else "没递过去：宿主回了否"
 
     # -- 给她看的摘要
     def status_text(self) -> str:
@@ -819,7 +830,7 @@ class Drive:
                      f"（上限 {int(self.config['maxWakesPerHour'])}）")
         lines.append(f"安静时段：{self.config['quietHours'] or '无'}；上网：{'开' if self.config['allowWeb'] else '关'}")
         lines.append(f"可翻阅：{'; '.join(str(root) for root in self.guard.roots)}")
-        lines.append(f"最近一次叫醒：{state.wake_note or '还没叫过'}")
+        lines.append(f"上一次自主时间：{state.wake_note or '还没给过'}")
         soul = self._soul_lines(2)
         if soul:
             lines.append("身份卡：" + " / ".join(soul))
