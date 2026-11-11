@@ -1,0 +1,11 @@
+{
+  "selfName": "炒饭智能",
+  "intervalMinutes": 15,
+  "firstDelayMinutes": 2,
+  "jitter": 0.4,
+  "maxWakesPerHour": 6,
+  "quietHours": "01:00-07:00",
+  "allowWeb": true,
+  "rootList": "",
+  "readLimitKB": 256
+}

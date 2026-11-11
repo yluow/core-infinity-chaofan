@@ -1,0 +1,17 @@
+# Private configuration and backups
+config.json
+.config-backups/
+
+# Local runtime and user data
+data/
+cache/
+*.log
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Test scratch directory
+.test-tmp/

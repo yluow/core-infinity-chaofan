@@ -1,0 +1,69 @@
+{
+  "type": "object",
+  "properties": {
+    "selfName": {
+      "type": "string",
+      "title": "她的名字",
+      "description": "自称。会出现在每次醒来的标题、状态摘要和事件元数据里。",
+      "default": "炒饭智能"
+    },
+    "intervalMinutes": {
+      "type": "number",
+      "title": "醒来的间隔（分钟）",
+      "description": "两次自主醒来之间的基准间隔；她可以自己用 mind_pace 临时改。",
+      "default": 15,
+      "minimum": 1,
+      "maximum": 720
+    },
+    "firstDelayMinutes": {
+      "type": "number",
+      "title": "启用后第一次醒来（分钟）",
+      "description": "插件启动后等多久才给第一次自主时间；0 表示立刻。",
+      "default": 2,
+      "minimum": 0,
+      "maximum": 720
+    },
+    "jitter": {
+      "type": "number",
+      "title": "间隔抖动",
+      "description": "0～1：每次醒来时间在基准间隔上随机前后浮动，避免像闹钟一样机械。",
+      "default": 0.4,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "maxWakesPerHour": {
+      "type": "integer",
+      "title": "每小时最多醒来几次",
+      "description": "硬上限；到顶后自动往后顺延，不会因为改配置而突破。",
+      "default": 6,
+      "minimum": 1,
+      "maximum": 60
+    },
+    "quietHours": {
+      "type": "string",
+      "title": "安静时段",
+      "description": "形如 01:00-07:00；支持跨零点（22:00-08:00）。留空表示不设安静时段。",
+      "default": "01:00-07:00"
+    },
+    "allowWeb": {
+      "type": "boolean",
+      "title": "允许上网",
+      "description": "关闭后 mind_web 会如实拒绝，而不是假装查过。",
+      "default": true
+    },
+    "rootList": {
+      "type": "string",
+      "title": "可翻阅的根目录",
+      "description": "分号分隔的绝对路径；留空表示只用运行数据根。她不能越过这些根。",
+      "default": ""
+    },
+    "readLimitKB": {
+      "type": "integer",
+      "title": "单次读取上限（KB）",
+      "description": "超过就截断并明确告诉你截断了。",
+      "default": 256,
+      "minimum": 1,
+      "maximum": 4096
+    }
+  }
+}
