@@ -3,7 +3,8 @@
   "firstDelayMinutes": 2,
   "jitter": 0.4,
   "maxWakesPerHour": 6,
-  "quietHours": "01:00-07:00",
+  "quietStart": "01:00",
+  "quietEnd": "07:00",
   "allowWeb": true,
   "rootList": "",
   "readLimitKB": 256

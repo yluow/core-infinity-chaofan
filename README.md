@@ -71,7 +71,7 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`：
 - **运行文件**（`journal.md`、`state.json`、`diag.log`）由工具维护，`mind_write`
   覆盖不了——"只追加"的笔记不会一次写成空白。
 - **脚本与可执行**（`.py`、`.ps1`、`.bat`、`.exe`…）和清单/配置页
-  （`package.json`、`config.schema.json`、`config.html`）读得到、写不进：
+  （`package.json`、`config.schema.json`）读得到、写不进：
   写文件这条路通不到"下一轮会被执行的代码"。
 - 二进制不读；超过 `readLimitKB` 截断并明说截断了。
 - 关掉 `allowWeb` 时 `mind_web` 如实拒绝，不假装查过。
@@ -97,7 +97,8 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`：
   "firstDelayMinutes": 2,
   "jitter": 0.4,
   "maxWakesPerHour": 6,
-  "quietHours": "01:00-07:00",
+  "quietStart": "01:00",
+  "quietEnd": "07:00",
   "allowWeb": true,
   "rootList": "",
   "readLimitKB": 256
@@ -110,14 +111,15 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`：
 | `firstDelayMinutes` | 启用后多久给第一次（0 = 立刻） |
 | `jitter` | 0～1，间隔随机浮动，避免像闹钟 |
 | `maxWakesPerHour` | 硬上限，到顶自动顺延 |
-| `quietHours` | 安静时段；页面上是**两个时间下拉栏**（开始 / 结束，跨零点直接选），存成 `01:00-07:00`；选「不设」就不限制 |
+| `quietStart` / `quietEnd` | 安静时段：控制台的「常规配置」里就是**两个时间下拉栏**（15 分钟一档，选「不设」或两端相同 = 不限制，跨零点照常选） |
 | `allowWeb` | 关掉就真的不能上网 |
 | `rootList` | 分号分隔的绝对路径；空 = 运行数据根 |
 | `readLimitKB` | 单次读取上限 |
 
-配置页里没有"名字"一栏：她的名字写在清单与身份卡里，不从配置读。宿主的通用表单和随包的
-`config.html` 都能改；保存由宿主重载插件生效。手改 `config.json` 时，开关写成
-`false` / `0` / `"false"` 都读得懂。
+配置页里没有"名字"一栏：她的名字写在清单与身份卡里，不从配置读。控件全由
+`config.schema.json` 决定（带 `enum` 的字段＝下拉），保存由宿主重载插件生效。手改
+`config.json` 时，开关写成 `false` / `0` / `"false"` 都读得懂；旧版那句
+`"quietHours": "01:00-07:00"` 也还认得。
 
 她自己用 `mind_pace` 调的排期不受配置页保存影响（配置页改的是基准，不是当前排期）。
 
@@ -137,7 +139,7 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`：
 
 - `rootList` 写项目目录（如 `D:\TelyinCore\core`，多个用 `;`）；留空时她只看得到运行数据根。
   写保护会拒掉脚本后缀，但**代码目录仍建议只放在她确实要读的地方**。
-- `quietHours` 按你的作息（两个下拉栏）；`intervalMinutes` 从 15 起步，嫌吵让她 `mind_pace pause`。
+- 安静时段按你的作息（常规配置里两个下拉栏）；`intervalMinutes` 从 15 起步，嫌吵让她 `mind_pace pause`。
 - `allowWeb` 决定她能不能上网。
 
 ## 已知限制
@@ -160,7 +162,7 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`：
 python -m unittest discover -s tests -v
 ```
 
-58 项合成回归：清单/路径/配置页契约（含安静时段那两个下拉栏）、安静时段与跨零点、
+60 项合成回归：清单/路径/配置声明契约（含安静时段那两个下拉 enum）、安静时段与跨零点、
 越界与凭据拒绝、运行文件与脚本后缀的写保护、笔记检索、文件读写与截断、联网拒绝路径、
 节拍（到期/未到期/暂停/上限/推送失败/失败重试沿用 dedup_key）、自定排期与重启后状态保持、
 名字不来自配置、到点不发任何 HTTP（不碰输入框）、身份卡只写一次且不覆盖、渠道标记认得出

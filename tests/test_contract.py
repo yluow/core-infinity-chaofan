@@ -141,11 +141,16 @@ class ManifestTests(unittest.TestCase):
     def test_pointers_stay_inside_plugin_dir(self):
         meta = self.manifest["telyincore"]
         root = ROOT.resolve()
-        for key in ("main", "configSchema", "configPage"):
+        for key in ("main", "configSchema"):
             value = meta.get(key, self.manifest.get(key))
             target = (ROOT / value).resolve()
             self.assertTrue(str(target).startswith(str(root)), f"{key} 越界: {target}")
             self.assertTrue(target.is_file(), f"{key} 不存在: {target}")
+
+    def test_no_custom_config_page(self):
+        """配置只用 schema 驱动的通用表单（安静时段靠 enum 出两个下拉），不随包带页面。"""
+        self.assertNotIn("configPage", self.manifest["telyincore"])
+        self.assertFalse((ROOT / "config.html").exists())
 
     def test_channel_marker_matches_the_wake_header(self):
         """渠道标记要认得出事件头（名字是插件自己的，不是配置项）。"""
@@ -165,33 +170,34 @@ class ManifestTests(unittest.TestCase):
         self.assertIn(plugin.SELF_NAME, first)
 
 
-class ConfigPageTests(unittest.TestCase):
+class QuietFieldTests(unittest.TestCase):
+    """安静时段：schema 里是两个带 enum 的键，通用表单据此渲染两个下拉。"""
+
     def setUp(self):
-        self.html = (ROOT / "config.html").read_text(encoding="utf-8")
+        self.schema = json.loads((ROOT / "config.schema.json").read_text(encoding="utf-8"))
+        self.example = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
 
-    def test_size_limit(self):
-        self.assertLessEqual((ROOT / "config.html").stat().st_size, 256 * 1024)
+    def test_two_enum_fields_render_as_dropdowns(self):
+        props = self.schema["properties"]
+        for name in ("quietStart", "quietEnd"):
+            self.assertIn(name, props, name)
+            field = props[name]
+            self.assertEqual(field["type"], "string", name)
+            self.assertIsInstance(field.get("enum"), list, name)
+            self.assertGreaterEqual(len(field["enum"]), 96, name)      # 15 分钟一档
+            self.assertIn(field["default"], field["enum"], name)
+            self.assertIn("不设", field["enum"], name)
+        self.assertNotIn("quietHours", props, "旧的一句式写法不再出现在 schema 里")
 
-    def test_no_external_resources(self):
-        for pattern in (r"""src\s*=\s*["'](?:https?:)?//""",
-                        r"""href\s*=\s*["'](?:https?:)?//""",
-                        r"@import\s+url"):
-            self.assertIsNone(re.search(pattern, self.html, re.I), pattern)
-
-    def test_bridge_contract(self):
-        for token in ("event.source !== parent", "telyincore:config:get",
-                      "telyincore:config:save", "telyincore:config:state",
-                      "telyincore:config:saved", "revision"):
-            self.assertIn(token, self.html)
-
-    def test_quiet_hours_is_two_time_selects(self):
-        """安静时段在页面上是两个时间下拉栏，不是一个手填的字符串。"""
-        self.assertIn("QUIET_FIELD = 'quietHours'", self.html)
-        self.assertIn("function buildQuiet(", self.html)
-        self.assertIn("createElement('select')", self.html)
-        self.assertIn("timeOptions(", self.html)
-        # 名字不再是配置项：页面里不该再有它的特殊分支
-        self.assertNotIn("selfName", self.html)
+    def test_enum_values_are_quarter_hours(self):
+        values = [v for v in self.schema["properties"]["quietStart"]["enum"] if v != "不设"]
+        self.assertEqual(values[0], "00:00")
+        self.assertEqual(values[-1], "23:45")
+        for value in values:
+            self.assertRegex(value, r"^\d{2}:\d{2}$")
+            hour, minute = value.split(":")
+            self.assertLess(int(hour), 24)
+            self.assertIn(int(minute), (0, 15, 30, 45))
 
 
 class SchemaTests(unittest.TestCase):
@@ -213,10 +219,47 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(self.example[name], field.get("default"), name)
 
     def test_config_loader_clamps(self):
-        config = plugin._load_config(ROOT)          # 没有 config.json ⇒ 全默认
-        self.assertGreaterEqual(config["intervalMinutes"], 1)
-        self.assertLessEqual(config["jitter"], 1)
-        self.assertIsInstance(config["allowWeb"], bool)
+        with workdir() as tmp:                      # 空目录：没有 config.json ⇒ 全默认
+            config = plugin._load_config(tmp)
+            self.assertGreaterEqual(config["intervalMinutes"], 1)
+            self.assertLessEqual(config["jitter"], 1)
+            self.assertIsInstance(config["allowWeb"], bool)
+            self.assertEqual(config["quietHours"], "01:00-07:00", "默认两个下拉要合成一句时段")
+
+    def test_quiet_pair_becomes_one_span(self):
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(
+                json.dumps({"quietStart": "22:00", "quietEnd": "08:00"}), encoding="utf-8")
+            config = plugin._load_config(tmp)
+            self.assertEqual(config["quietHours"], "22:00-08:00")
+            self.assertEqual(plugin._quiet_span(config["quietHours"]), (1320, 480))
+
+    def test_quiet_off_cases(self):
+        """选「不设」、或两端同一时刻 ⇒ 不设安静时段。"""
+        with workdir() as tmp:
+            for pair in ({"quietStart": "不设", "quietEnd": "07:00"},
+                         {"quietStart": "01:00", "quietEnd": "不设"},
+                         {"quietStart": "07:00", "quietEnd": "07:00"}):
+                (tmp / "config.json").write_text(json.dumps(pair), encoding="utf-8")
+                self.assertEqual(plugin._load_config(tmp)["quietHours"], "", pair)
+
+    def test_legacy_quiet_hours_still_loads(self):
+        """0.1.3 及更早的 config.json 只有一句式 quietHours，读起来不能丢。"""
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(
+                json.dumps({"quietHours": "23:30-06:30"}), encoding="utf-8")
+            self.assertEqual(plugin._load_config(tmp)["quietHours"], "23:30-06:30")
+
+    def test_config_json_with_bom_still_loads(self):
+        """Windows 那头存出来的 config.json 带 BOM：不能因此整份当成没有。"""
+        with workdir() as tmp:
+            (tmp / "config.json").write_bytes(
+                b"\xef\xbb\xbf" + json.dumps(
+                    {"quietStart": "22:00", "quietEnd": "08:00", "readLimitKB": 64}
+                ).encode("utf-8"))
+            config = plugin._load_config(tmp)
+            self.assertEqual(config["quietHours"], "22:00-08:00")
+            self.assertEqual(config["readLimitKB"], 64)
 
     def test_boolean_written_as_text_is_read(self):
         """手改的 config.json 常把开关写成 "false" ／ 0，不能读成真。"""

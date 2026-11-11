@@ -39,7 +39,7 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.1.4"
 
 #: 她的名字。写死：名字是身份卡的事，不是配置栏的事（0.1.3 起不再做成一栏）。
 SELF_NAME = "炒饭智能"
@@ -59,7 +59,9 @@ DEFAULTS = {
     "firstDelayMinutes": 2.0,
     "jitter": 0.4,
     "maxWakesPerHour": 6,
-    "quietHours": "01:00-07:00",
+    # 安静时段在两个键里：页面上就是两个时间下拉（不设 = "不设" 或起止相同）。
+    "quietStart": "01:00",
+    "quietEnd": "07:00",
     "allowWeb": True,
     "rootList": "",
     "readLimitKB": 256,
@@ -141,7 +143,8 @@ def _flag(value, default: bool) -> bool:
 
 def _read_json(path: Path, default):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig：别让 Windows 那头存的 BOM 把整份配置读成"不存在"（宿主也这么读）。
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return default
 
@@ -197,6 +200,27 @@ def _in_quiet(ts: float, span: tuple[int, int] | None) -> bool:
     if start < end:
         return start <= minute < end
     return minute >= start or minute < end      # 跨零点
+
+
+def _span_wire(start: int, end: int) -> str:
+    """把两个分钟数写成 `HH:MM-HH:MM`。"""
+    return f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+
+
+def _normal_wire(text) -> str:
+    """旧写法（`01:00-07:00`）规整一下；认不出就说"不设"。"""
+    span = _quiet_span(_text(text, 20))
+    return "" if span is None else _span_wire(*span)
+
+
+def _quiet_wire(start, end) -> str:
+    """两个下拉合成一句。任一端是「不设」／认不出，或起止相同 ⇒ 不设安静时段。"""
+    if _text(start, 8) in ("", "不设") or _text(end, 8) in ("", "不设"):
+        return ""
+    first, last = _clock_minutes(start), _clock_minutes(end)
+    if first is None or last is None or first == last:
+        return ""
+    return _span_wire(first, last)
 
 
 class _Text(HTMLParser):
@@ -492,7 +516,12 @@ class Drive:
                                       self._dir / "journal.md",
                                       self._dir / "diag.log"])
         self.web = Web(bool(config["allowWeb"]), self._log)
-        self._quiet = _quiet_span(str(config["quietHours"]))
+        # 两种形状都收：_load_config 给的是一句 `HH:MM-HH:MM`；直接喂 DEFAULTS 的
+        # 调用方只有两个下拉键，这里自己合成。
+        wire = config.get("quietHours")
+        if wire is None:
+            wire = _quiet_wire(config.get("quietStart", ""), config.get("quietEnd", ""))
+        self._quiet = _quiet_span(str(wire))
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -918,7 +947,7 @@ def _load_config(package_dir: Path) -> dict:
     config = dict(DEFAULTS)
     raw = _read_json(package_dir / "config.json", None)
     if not isinstance(raw, dict):
-        return config
+        raw = {}                      # 没有配置文件：全默认，下面照样把它算成一句时段
     for key, default in DEFAULTS.items():
         value = raw.get(key, default)
         if isinstance(default, bool):
@@ -932,7 +961,15 @@ def _load_config(package_dir: Path) -> dict:
     config["jitter"] = max(0.0, min(1.0, _number(config["jitter"], 0.4)))
     config["maxWakesPerHour"] = int(max(1, min(60, _number(config["maxWakesPerHour"], 6))))
     config["readLimitKB"] = int(max(1, min(4096, _number(config["readLimitKB"], 256))))
-    config["quietHours"] = _text(config["quietHours"], 20)
+    config["quietStart"] = _text(config["quietStart"], 8)
+    config["quietEnd"] = _text(config["quietEnd"], 8)
+    # 内部仍用一句 `HH:MM-HH:MM`（`_quiet_span` 不用改），对外是两个下拉键。
+    if "quietStart" in raw or "quietEnd" in raw:
+        config["quietHours"] = _quiet_wire(config["quietStart"], config["quietEnd"])
+    elif "quietHours" in raw:
+        config["quietHours"] = _normal_wire(raw["quietHours"])       # 老配置回填
+    else:
+        config["quietHours"] = _quiet_wire(config["quietStart"], config["quietEnd"])
     return config
 
 
