@@ -64,6 +64,20 @@
       "default": 256,
       "minimum": 1,
       "maximum": 4096
+    },
+    "wakeViaSay": {
+      "type": "boolean",
+      "title": "用本机回环叫醒",
+      "description": "开着：到点把这句话递进控制台输入队列（真正叫醒她）；关掉：只写事件库。",
+      "default": true
+    },
+    "wakePort": {
+      "type": "integer",
+      "title": "控制台端口",
+      "description": "回环唤醒要投递到的本机端口（与控制台页一致，默认 7799）。",
+      "default": 7799,
+      "minimum": 1,
+      "maximum": 65535
     }
   }
 }

@@ -7,5 +7,7 @@
   "quietHours": "01:00-07:00",
   "allowWeb": true,
   "rootList": "",
-  "readLimitKB": 256
+  "readLimitKB": 256,
+  "wakeViaSay": true,
+  "wakePort": 7799
 }

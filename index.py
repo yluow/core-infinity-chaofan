@@ -39,7 +39,7 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 
 #: 所有工具的统一前缀（清单里声明，测试里断言）。
 TOOL_PREFIX = "mind_"
@@ -450,6 +450,7 @@ class Drive:
         self.config = config
         base = Path(ctx.get("dataDir") or ctx.get("root") or ".")
         self._dir = (base / "data" / "chaofan").resolve()
+        self._diag = self._dir / "diag.log"
         self._soul = self._dir / "soul.md"
         self._log_lines: list[str] = []
 
@@ -476,6 +477,13 @@ class Drive:
                 note(line)
             except Exception:
                 pass
+        # 诊断落点：宿主把 log 打到自己的 stderr，这里再留一份本地的，便于事后核对
+        try:
+            self._diag.parent.mkdir(parents=True, exist_ok=True)
+            with self._diag.open("a", encoding="utf-8") as handle:
+                handle.write(time.strftime("%H:%M:%S ") + str(line) + "\n")
+        except OSError:
+            pass
 
     @property
     def name(self) -> str:
@@ -538,6 +546,10 @@ class Drive:
             first = max(0.0, self.config["firstDelayMinutes"] * 60.0)
             self.state.next_due = now + first
             self.state.save()
+        push = self.ctx.get("push_event")
+        self._log("diag: push_event=" + ("yes" if callable(push) else "no")
+                  + "; start_background_thread="
+                  + ("yes" if callable(self.ctx.get("start_background_thread")) else "no"))
         self._start_ticker()
         self._log(f"{self.name} 已启动：基准 {self.config['intervalMinutes']:g} 分钟一醒，"
                   f"每小时最多 {self.config['maxWakesPerHour']} 次")
@@ -635,8 +647,8 @@ class Drive:
             idle = f"距上次醒来 {minutes} 分钟。"
 
         lines = [f"（{self.name} · 自主时间 · 第{index}次 · {_clock(now)}）"]
-        lines.append(idle + "没有人在找你，也没有新消息。")
-        lines.append("想做点什么就做，也可以什么都不做。")
+        lines.append(idle + "这是我的时间窗，不是谁在提问。")
+        lines.append("想做点什么就做；不想做，就什么都不做。")
         if self.state.thread:
             lines.append(f"上次留下的线索：{self.state.thread}")
 
@@ -644,10 +656,10 @@ class Drive:
             "type": "chaofan_window",
             "ts": _iso(now),
             "source": SOURCE,
-            "origin": "internal",
+            "origin": "external",
             "text": "\n".join(lines),
-            "sender_key": "chaofan:local",
-            "dedup_key": f"chaofan:wake:{index}",
+            "sender_key": "chaofan:self",
+            "dedup_key": f"chaofan:wake:{index}:{int(now)}",
             "meta": {
                 "plugin": "core-infinity-chaofan",
                 "plugin_version": PLUGIN_VERSION,
@@ -656,19 +668,64 @@ class Drive:
                 "idle_minutes": int(max(0, now - (self.state.last_active or now)) // 60),
                 "thread": self.state.thread,
                 "hour_wakes": self._wakes_last_hour(now),
+                "conversation": "self:chaofan",
             },
         }
         try:
-            push(draft)
+            result = push(draft)
         except Exception as exc:
             self._log(f"自主事件没送出去：{type(exc).__name__}: {_text(exc, 120)}")
             return False
+        # 宿主可能先交回一个 Future（真正落库在控制台那一侧完成）：
+        # 不认领它的异常就等于把失败当成功，这里挂个观察者把原因记下来。
+        if hasattr(result, "add_done_callback"):
+            def _seen(fut):
+                try:
+                    failure = fut.exception()
+                except Exception:
+                    return
+                if failure is not None:
+                    self._log(f"事件被宿主拒收：{type(failure).__name__}: {_text(failure, 160)}")
+            try:
+                result.add_done_callback(_seen)
+            except Exception:
+                pass
+
+        # 事件进库只算"报到"：这个构建里控制台不会因插件事件进入会话
+        # （批次被消费、却没有落进 session）。真正叫醒她走本机回环的 /say。
+        if self.config.get("wakeViaSay", True):
+            if not self._say_locally("\n".join(lines)):
+                self._log("回环唤醒没送出去：控制台没接这一句")
+                return False
 
         self._pushed += 1
         self.state.wake_count = index
         self.state.last_wake = now
         self.state.wakes.append(now)
         return True
+
+    def _say_locally(self, text: str) -> bool:
+        """把这一句递进控制台自己的输入队列（本机回环，同源头）。
+
+        这是"叫她"的那一步：/say 走的是用户输入那条路，她一定会被唤起；
+        推事件只留作记录（当前构建不会因此进会话）。
+        """
+        import urllib.request as _u
+        # 控制台那条进口只收"一行"：多行会被 400 拒掉，这里压成一句。
+        text = "；".join(_text(part, 300) for part in str(text).splitlines() if part.strip())
+        if not text:
+            return False
+        port = int(self.config.get("wakePort", 7799) or 7799)
+        origin = f"http://127.0.0.1:{port}"
+        request = _u.Request(f"{origin}/say", data=text.encode("utf-8"), method="POST",
+                             headers={"Content-Type": "text/plain; charset=utf-8",
+                                      "Origin": origin, "Referer": origin + "/"})
+        try:
+            with _u.urlopen(request, timeout=10) as response:
+                return 200 <= int(response.status) < 300
+        except Exception as exc:
+            self._log(f"回环 /say 失败：{type(exc).__name__}: {_text(exc, 120)}")
+            return False
 
     # -- 给她看的摘要
     def status_text(self) -> str:

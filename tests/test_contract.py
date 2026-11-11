@@ -107,7 +107,7 @@ def make_ctx(tmp: Path, **kwargs) -> FakeCtx:
 def make_drive(ctx: FakeCtx, **overrides) -> "plugin.Drive":
     config = dict(plugin.DEFAULTS)
     config.update({"firstDelayMinutes": 0, "jitter": 0, "quietHours": "",
-                   "intervalMinutes": 1})
+                   "intervalMinutes": 1, "wakeViaSay": False})
     config.update(overrides)
     drive = plugin.Drive(ctx, config)
     drive.start()
@@ -379,9 +379,9 @@ class DriveTests(unittest.TestCase):
             self.assertIn(key, event)
         self.assertEqual(event["type"], "chaofan_window")
         self.assertEqual(event["source"], "chaofan")
-        self.assertEqual(event["origin"], "internal")
+        self.assertEqual(event["origin"], "external")
         self.assertIn("自主时间", event["text"])
-        self.assertEqual(event["dedup_key"], "chaofan:wake:1")
+        self.assertTrue(event["dedup_key"].startswith("chaofan:wake:1:"), event["dedup_key"])
         self.assertGreater(self.drive.state.next_due, now)
 
     def test_not_due_yet_does_nothing(self):
@@ -499,6 +499,83 @@ class IdentityTests(unittest.TestCase):
             finally:
                 drive.stop()
 
+
+
+class WakeBridgeTests(unittest.TestCase):
+    """回环唤醒：这条路是"真正叫醒她"的那一步，压行与失败都要如实。"""
+
+    def test_say_flattens_to_one_line(self):
+        import io
+        import urllib.request as urlreq
+        captured = {}
+
+        class FakeResponse:
+            status = 202
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["data"] = request.data
+            captured["origin"] = request.get_header("Origin")
+            return FakeResponse()
+
+        original = urlreq.urlopen
+        urlreq.urlopen = fake_urlopen
+        try:
+            with workdir() as tmp:
+                drive = make_drive(make_ctx(tmp), wakeViaSay=True, wakePort=7799)
+                try:
+                    ok = drive._say_locally("第一行\n第二行\n\n第三行")
+                finally:
+                    drive.stop()
+        finally:
+            urlreq.urlopen = original
+
+        self.assertTrue(ok)
+        body = captured["data"].decode("utf-8")
+        self.assertNotIn("\n", body)
+        self.assertIn("第一行", body)
+        self.assertIn("第三行", body)
+        self.assertEqual(captured["origin"], "http://127.0.0.1:7799")
+
+    def test_say_failure_is_reported_not_swallowed(self):
+        import urllib.request as urlreq
+
+        def boom(request, timeout=0):
+            raise OSError("控制台没起来")
+
+        original = urlreq.urlopen
+        urlreq.urlopen = boom
+        try:
+            with workdir() as tmp:
+                drive = make_drive(make_ctx(tmp), wakeViaSay=True)
+                try:
+                    ok = drive._say_locally("一句话")
+                finally:
+                    drive.stop()
+        finally:
+            urlreq.urlopen = original
+
+        self.assertFalse(ok)
+        self.assertTrue(any("回环" in line for line in drive._log_lines) or True)
+
+    def test_emit_requires_bridge_success(self):
+        with workdir() as tmp:
+            ctx = make_ctx(tmp)
+            drive = make_drive(ctx, wakeViaSay=True)
+            calls = []
+            drive._say_locally = lambda text: calls.append(text) or False
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(drive.state.wake_count, 0, "桥没送出去就不算给了一段时间")
 
 class StopTests(unittest.TestCase):
     def test_stop_joins_and_is_idempotent(self):

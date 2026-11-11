@@ -1,10 +1,12 @@
 {
   "name": "core-infinity-chaofan",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "yluow",
   "license": "MIT",
   "description": "炒饭智能：没人叫也会醒，自己决定想什么、翻哪些文件、看哪些网页。",
-  "keywords": ["core-infinity"],
+  "keywords": [
+    "core-infinity"
+  ],
   "main": "index.py",
   "telyincore": {
     "kind": "infinity",
@@ -12,6 +14,20 @@
     "displayName": "炒饭智能",
     "icon": "chip",
     "configSchema": "config.schema.json",
-    "configPage": "config.html"
+    "configPage": "config.html",
+    "channels": [
+      {
+        "label": "自",
+        "scope": "自",
+        "source": "chaofan",
+        "context": "context/chaofan.md",
+        "markers": [
+          {
+            "scope": "自",
+            "pattern": "^（炒饭智能 · 自主时间"
+          }
+        ]
+      }
+    ]
   }
 }

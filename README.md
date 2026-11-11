@@ -13,20 +13,23 @@
 
 **1. 给时间**
 
-ticker 按 `间隔 ± 抖动` 推一条内部事件：
+ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，同时把同一句话
+递进控制台的输入队列（本机回环 `POST /say`）——**后者才是真正叫醒她的那一步**。
 
 ```
-（炒饭智能 · 自主时间 · 第1次 · 04:42）
-你刚动过手。没有人在找你，也没有新消息。
-想做点什么就做，也可以什么都不做。
+（炒饭智能 · 自主时间 · 第1次 · 05:25）
+这是我的时间窗，不是谁在提问。
+想做点什么就做；不想做，就什么都不做。
 上次留下的线索：去查一下潮汐表，顺便看看明天天气
 ```
 
-事件字段：`type=chaofan_window`、`source=chaofan`、`origin=internal`、
-`dedup_key=chaofan:wake:<次数>`，`meta` 带 `self_name / wake_index /
-idle_minutes / thread / hour_wakes`。
+事件字段：`type=chaofan_window`、`source=chaofan`、`origin=external`、
+`sender_key=chaofan:self`、`dedup_key=chaofan:wake:<次数>:<时间戳>`。
 
-它只说「现在有一段自由时间」，不替她决定说什么、做什么，也不假造她的发言。
+> 为什么还要推事件：事件库是留痕（谁在什么时候给过时间），也是给以后宿主支持
+> "插件事件直接进会话"留的路。当前构建里它只被消费成一批、不落进会话，
+> 所以真正叫醒她走的是 `wakeViaSay`（默认开）。关掉它，插件就只剩记录。
+
 
 **2. 给手（7 个 `mind_*` 工具）**
 
