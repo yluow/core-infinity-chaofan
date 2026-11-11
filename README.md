@@ -3,10 +3,12 @@
 给控制台里的她一段**没人占用的时间**，一副自己能动的手脚，和一份能记住自己的身份卡。
 
 - 插件类型：Infinity（`api: 1`），Python 3.10+，无第三方依赖
+- 版本：0.1.2（改了什么都记在 [CHANGELOG.md](CHANGELOG.md)）
 - 数据位置：`<运行数据根>/data/chaofan/`
   - `soul.md`：身份卡，第一次启动写入，之后她可以用 `mind_write` 自己改
-  - `journal.md`：她写下的笔记，只追加
+  - `journal.md`：她写下的笔记，工具只追加
   - `state.json`：下次几点醒、暂停到几点、醒来次数、线索
+  - `diag.log`：本机诊断留痕
 - 许可：MIT
 
 ## 它做什么
@@ -29,7 +31,7 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
 > 为什么还要推事件：事件库是留痕（谁在什么时候给过时间），也是给以后宿主支持
 > "插件事件直接进会话"留的路。当前构建里它只被消费成一批、不落进会话，
 > 所以真正叫醒她走的是 `wakeViaSay`（默认开）。关掉它，插件就只剩记录。
-
+> 没送出去的那一次会**沿用同一条 `dedup_key` 重试**，事件库里不会多出一条「第 1 次」。
 
 **2. 给手（7 个 `mind_*` 工具）**
 
@@ -41,11 +43,11 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
 | `mind_fs(op, path, query)` | `list` 列目录 / `read` 读文本 / `find` 按文件名找 |
 | `mind_write(path, content)` | 写文件（暂存 → fsync → 原子替换），也能改 `soul.md` |
 | `mind_web(op, query, url)` | `search` 搜网页 / `fetch` 抓正文（stdlib，无第三方包） |
-| `mind_pace(action, minutes)` | `next` 自己定下次几点醒 / `pause` 安静一阵 / `resume` 立刻回来 |
+| `mind_pace(action, minutes)` | `next` 自己定下次几点醒（顺带解掉暂停）/ `pause` 安静一阵 / `resume` 立刻回来 |
 
 **3. 给身份**
 
-首次启动写入 `soul.md`：
+首次启动、`soul.md` 不存在时写入一次；文件在就一个字不动：
 
 ```markdown
 # 炒饭智能
@@ -61,16 +63,30 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
 ```
 
 这份文件是她的，`mind_status` 会显示前两行和文件路径；改一次，下次醒来就看见改了。
-插件**只在她没改过时**写一次，从不覆盖。
 
 **4. 守边界**
 
 - 文件访问钉在 `rootList`（留空 = 运行数据根）内，`..` 越界直接拒。
 - `.env*`、`config.json`、`id_rsa`、`*.pem/.key/.pfx` 读不到也写不进。
 - `.git`、`.ssh`、备份目录可读不可写。
+- **运行文件**（`journal.md`、`state.json`、`diag.log`）由工具维护，`mind_write`
+  覆盖不了——"只追加"的笔记不会一次写成空白。
+- **脚本与可执行**（`.py`、`.ps1`、`.bat`、`.exe`…）和清单/配置页
+  （`package.json`、`config.schema.json`、`config.html`）读得到、写不进：
+  写文件这条路通不到"下一轮会被执行的代码"。
 - 二进制不读；超过 `readLimitKB` 截断并明说截断了。
 - 关掉 `allowWeb` 时 `mind_web` 如实拒绝，不假装查过。
 - 搜索无结果、网页抓不到、写盘失败，全部如实返回。
+
+## 它用 `ctx` 里的什么
+
+| 用到的 | 干什么 | 缺了会怎样 |
+|---|---|---|
+| `packageDir` | 读 `config.json` | 必需 |
+| `dataDir` / `root` / `botDir` | 数据和笔记的落点 | 退到 `root` |
+| `log` | 记一行 | 不记，照跑 |
+| `push_event` | 报一件自主时间（进事件库） | 明说「给不出去」，不假装给过 |
+| `start_background_thread` | 把 ticker 交给宿主登记与管理 | 自己起线程并自己 join |
 
 ## 配置
 
@@ -86,13 +102,15 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
   "quietHours": "01:00-07:00",
   "allowWeb": true,
   "rootList": "",
-  "readLimitKB": 256
+  "readLimitKB": 256,
+  "wakeViaSay": true,
+  "wakePort": 7799
 }
 ```
 
 | 键 | 说明 |
 |---|---|
-| `selfName` | 她的自称，出现在醒来标题、状态与事件元数据里 |
+| `selfName` | 她的自称，出现在醒来标题、状态与事件元数据里（渠道标记跟着名字走，改名字不影响识别） |
 | `intervalMinutes` | 两次醒来之间的基准间隔 |
 | `firstDelayMinutes` | 启用后多久给第一次（0 = 立刻） |
 | `jitter` | 0～1，间隔随机浮动，避免像闹钟 |
@@ -101,8 +119,11 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
 | `allowWeb` | 关掉就真的不能上网 |
 | `rootList` | 分号分隔的绝对路径；空 = 运行数据根 |
 | `readLimitKB` | 单次读取上限 |
+| `wakeViaSay` | 到点是否把这句话递进控制台输入队列（真正叫醒她）；关掉只写事件库 |
+| `wakePort` | 控制台端口，默认 7799；要与页面地址的端口一致 |
 
-宿主的通用表单和随包的 `config.html` 都能改；保存由宿主重载插件生效。
+宿主的通用表单和随包的 `config.html` 都能改；保存由宿主重载插件生效。手改
+`config.json` 时，开关写成 `false` / `0` / `"false"` 都读得懂。
 她自己用 `mind_pace` 调的排期不受配置页保存影响（配置页改的是基准，不是当前排期）。
 
 ## 生命周期
@@ -112,6 +133,7 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
   `start_background_thread(thread, stop=...)` 时先登记再启动。
 - `stop()` 同步：置信号 → `join` → 核验退出。超时保留线程引用与 `_stop_error`，
   不宣称停完；重复调用幂等。
+- 停过之后同一实例还能再 `start()`：`_stopped` 与上次的失败责任一起清掉。
 - 任何工具调用都会更新 `last_active`，自主事件里的"距上次动静"来自它。
 
 ## 安装
@@ -119,16 +141,22 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
 放到 `core/extensions/core-infinity-chaofan/`，刷新插件列表手动启用。第一次醒来前先定好：
 
 - `rootList` 写项目目录（如 `D:\TelyinCore\core`，多个用 `;`）；留空时她只看得到运行数据根。
+  写保护会拒掉脚本后缀，但**代码目录仍建议只放在她确实要读的地方**。
 - `quietHours` 按你的作息；`intervalMinutes` 从 15 起步，嫌吵让她 `mind_pace pause`。
 - `allowWeb` 决定她能不能上网。
+- `wakePort` 与控制台页面一致（默认 7799），否则回环唤醒送不进去。
 
 ## 已知限制
 
 - **不会自己发消息**：发言仍走本体已有的 speech 工具；本插件只给时间与手脚。
 - 联网用 DuckDuckGo HTML 端点，被反爬时返回"没有结果"，不伪造。
 - 工具是同步阻塞的（与现有插件一致），一次搜索最长约 12 秒。
+- `mind_fs find` 有界：最多 4 层深、60 条命中，到顶就停（不是全盘搜索）。
 - 单写者假设：两个实例指向同一数据根会互相覆盖。
 - 不判断"她现在忙不忙"：只在安静时段和每小时上限内给时间，忙时也可能醒一次。
+- `context/chaofan.md`（渠道环境说明）只在宿主的 scene 模式下参与提示；其他模式里
+  它只是声明，事件仍只落事件库。
+- `journal.md` 不能被 `mind_write` 清空：要归档就另写一份，笔记这条线只增不删。
 
 ## 测试
 
@@ -136,7 +164,9 @@ ticker 按 `间隔 ± 抖动` 到点，往事件库写一条 `chaofan_window`，
 python -m unittest discover -s tests -v
 ```
 
-45 项合成回归：清单/路径/配置页契约、安静时段与跨零点、越界与凭据拒绝、
-笔记检索、文件读写与截断、联网拒绝路径、节拍（到期/未到期/暂停/上限/推送失败）、
-自定排期与重启后状态保持、身份卡只写一次且不覆盖、自称贯穿事件与状态、停止与超时保留责任。
+59 项合成回归：清单/路径/配置页契约、安静时段与跨零点、越界与凭据拒绝、运行文件与
+脚本后缀的写保护、笔记检索、文件读写与截断、联网拒绝路径、节拍（到期/未到期/暂停/
+上限/推送失败/失败重试沿用 dedup_key）、自定排期与重启后状态保持、`wakeViaSay`/
+`wakePort` 从 `config.json` 读得到且被夹取、关掉回环就不碰 `/say`、身份卡只写一次且
+不覆盖、自称贯穿事件与状态、渠道标记认得改过名的她、停止与超时保留责任、停过再起。
 测试用桩替身，不联网、不碰用户数据。

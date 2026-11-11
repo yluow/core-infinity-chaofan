@@ -147,6 +147,22 @@ class ManifestTests(unittest.TestCase):
             self.assertTrue(str(target).startswith(str(root)), f"{key} 越界: {target}")
             self.assertTrue(target.is_file(), f"{key} 不存在: {target}")
 
+    def test_channel_marker_matches_renamed_self(self):
+        """自称可配（selfName），渠道标记就不能写死一个名字。"""
+        meta = self.manifest["telyincore"]
+        pattern = meta["channels"][0]["markers"][0]["pattern"]
+        marker = re.compile(pattern)
+        with workdir() as tmp:
+            ctx = make_ctx(tmp)
+            drive = make_drive(ctx, selfName="小炒")
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+        first = ctx.events[0]["text"].splitlines()[0]
+        self.assertTrue(marker.search(first), f"{pattern!r} 认不出 {first!r}")
+
 
 class ConfigPageTests(unittest.TestCase):
     def setUp(self):
@@ -191,6 +207,31 @@ class SchemaTests(unittest.TestCase):
         self.assertGreaterEqual(config["intervalMinutes"], 1)
         self.assertLessEqual(config["jitter"], 1)
         self.assertIsInstance(config["allowWeb"], bool)
+
+    def test_wake_keys_survive_config_json(self):
+        """0.1.1 的漏项：schema 里有、DEFAULTS 里没有 ⇒ 页面上关了也不生效。"""
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(
+                json.dumps({"wakeViaSay": False, "wakePort": 8123}), encoding="utf-8")
+            config = plugin._load_config(tmp)
+            self.assertIs(config["wakeViaSay"], False)
+            self.assertEqual(config["wakePort"], 8123)
+
+    def test_wake_port_is_clamped(self):
+        with workdir() as tmp:
+            for raw, want in ((99999, 65535), (0, 1), ("不是数字", 7799)):
+                (tmp / "config.json").write_text(
+                    json.dumps({"wakePort": raw}), encoding="utf-8")
+                self.assertEqual(plugin._load_config(tmp)["wakePort"], want, raw)
+
+    def test_boolean_written_as_text_is_read(self):
+        """手改的 config.json 常把开关写成 "false" ／ 0，不能读成真。"""
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(
+                json.dumps({"allowWeb": "false", "wakeViaSay": 0}), encoding="utf-8")
+            config = plugin._load_config(tmp)
+            self.assertIs(config["allowWeb"], False)
+            self.assertIs(config["wakeViaSay"], False)
 
 
 class QuietTests(unittest.TestCase):
@@ -249,6 +290,25 @@ class GuardTests(unittest.TestCase):
         text, truncated = self.guard.read_text(big)
         self.assertTrue(truncated)
         self.assertLess(len(text), 5000)
+
+    def test_runtime_files_are_not_overwritten(self):
+        journal = self.root / "journal.md"
+        guard = plugin.Guard([self.root.resolve()], 1, protected=[journal])
+        self.assertTrue(guard.resolve("journal.md"))          # 读得到
+        with self.assertRaises(plugin.Denied):                # 写不到
+            guard.resolve("journal.md", for_write=True)
+
+    def test_scripts_are_readable_but_not_writable(self):
+        (self.root / "run.py").write_text("print(1)", encoding="utf-8")
+        self.assertTrue(self.guard.resolve("run.py"))
+        for name in ("run.py", "deploy.ps1", "x.bat", "hook.sh", "tick.exe",
+                     "package.json", "config.schema.json"):
+            with self.assertRaises(plugin.Denied, msg=name):
+                self.guard.resolve(name, for_write=True)
+
+    def test_plain_text_still_writes(self):
+        target = self.guard.resolve("notes/今天.md", for_write=True)
+        self.assertTrue(str(target).endswith("今天.md"))
 
 
 class JournalTests(unittest.TestCase):
@@ -453,6 +513,52 @@ class DriveTests(unittest.TestCase):
         finally:
             again.stop()
 
+    def test_pace_next_releases_pause(self):
+        self.drive.state.paused_until = time.time() + 3600
+        self.drive.pace("next", minutes=1)
+        self.assertEqual(self.drive.state.paused_until, 0.0)
+
+    def test_retry_reuses_dedup_key(self):
+        """桥没送出去要重试；重试不能变成第二条「第 1 次」报到。"""
+        with workdir() as tmp:
+            ctx = make_ctx(tmp)
+            drive = make_drive(ctx, wakeViaSay=True)      # 这条路要开着才谈得上"桥失败"
+            calls = []
+            drive._say_locally = lambda text: calls.append(text) or False
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+                first = ctx.events[0]["dedup_key"]
+                self.assertEqual(drive.state.wake_count, 0)
+
+                drive._say_locally = lambda text: True
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+        self.assertEqual(ctx.events[1]["dedup_key"], first)
+        self.assertEqual(drive.state.wake_count, 1)
+
+    def test_wake_off_takes_no_say_path(self):
+        """config.json 里关掉回环：不碰 /say，事件照样报到。"""
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(json.dumps({
+                "wakeViaSay": False, "firstDelayMinutes": 0,
+                "intervalMinutes": 1, "jitter": 0, "quietHours": ""}), encoding="utf-8")
+            ctx = make_ctx(tmp)
+            ctx["packageDir"] = str(tmp)
+            drive = plugin.Drive(ctx, plugin._load_config(tmp))
+            drive.start()
+            calls = []
+            drive._say_locally = lambda text: calls.append(text) or True
+            try:
+                drive.state.next_due = 0
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+            self.assertEqual(calls, [])
+            self.assertEqual(len(ctx.events), 1)
+
 
 class IdentityTests(unittest.TestCase):
     def test_soul_seeded_once_and_never_overwritten(self):
@@ -617,6 +723,20 @@ class StopTests(unittest.TestCase):
             finally:
                 drive.stop()
             self.assertFalse(ctx.registered[0].is_alive())
+
+    def test_start_after_stop_works(self):
+        """宿主重载是新建实例，但契约写的是 start/stop——停过再起要说实话。"""
+        with workdir() as tmp:
+            drive = make_drive(make_ctx(tmp))
+            drive.stop()
+            drive.start()
+            try:
+                self.assertFalse(drive._stopped)
+                self.assertIn("在跑", drive.status_text())
+                self.assertIsNotNone(drive._thread)
+            finally:
+                drive.stop()
+            self.assertIsNone(drive._thread)
 
 
 if __name__ == "__main__":

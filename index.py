@@ -39,7 +39,7 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 
 #: 所有工具的统一前缀（清单里声明，测试里断言）。
 TOOL_PREFIX = "mind_"
@@ -61,6 +61,10 @@ DEFAULTS = {
     "allowWeb": True,
     "rootList": "",
     "readLimitKB": 256,
+    # 这两个是 0.1.1 的漏项：schema 里有、配置页上也画得出来，但读取时不认，
+    # 于是"关掉回环叫醒"关不掉。放进 DEFAULTS 才进得了 _load_config 的那一圈。
+    "wakeViaSay": True,
+    "wakePort": 7799,
 }
 
 #: 永远不给读/写的东西：凭据与宿主配置。
@@ -69,6 +73,12 @@ DENY_NAMES = {".env", "config.json", "credentials.json", "id_rsa",
 DENY_SUFFIX = {".key", ".pem", ".pfx", ".p12", ".pyc", ".keystore"}
 #: 可以读、但绝不往里写。
 DENY_WRITE_PARTS = {".git", ".ssh", ".config-backups", "__pycache__"}
+#: 读得到、写不进的：脚本与可执行。写文件这条路不该通到"下一轮会被执行的代码"。
+DENY_WRITE_SUFFIX = {".py", ".pyw", ".pyi", ".bat", ".cmd", ".ps1", ".psm1",
+                     ".vbs", ".vbe", ".sh", ".dll", ".exe", ".com", ".scr",
+                     ".msi", ".lnk", ".pif", ".so", ".dylib", ".jar"}
+#: 清单本身也不写：它指向 `main`，改它就是改下一次装载会 import 什么。
+DENY_WRITE_NAMES = {"package.json", "config.schema.json", "config.html"}
 
 _USER_AGENT = f"ChaofanIntelligence/{PLUGIN_VERSION} (+local TelyinCore plugin)"
 
@@ -115,6 +125,20 @@ def _number(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _flag(value, default: bool) -> bool:
+    """布尔读得宽一点：页面给真布尔，手改的 config.json 常写成 "false" ／ 0。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = _text(value, 12).lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off", ""}:
+        return False
+    return default
 
 
 def _read_json(path: Path, default):
@@ -228,9 +252,11 @@ class Denied(Exception):
 class Guard:
     """把所有文件访问钉在允许的根目录里；越界与凭据文件一律拒绝。"""
 
-    def __init__(self, roots: list[Path], read_kb: int):
+    def __init__(self, roots: list[Path], read_kb: int, protected: list[Path] | None = None):
         self.roots = roots
         self.read_bytes = max(1024, read_kb * 1024)
+        #: 插件自己的运行文件（笔记 ／ 状态 ／ 诊断）：由工具维护，不交给整篇覆盖。
+        self.protected = {path.resolve() for path in (protected or ())}
 
     @property
     def base(self) -> Path:
@@ -256,8 +282,15 @@ class Guard:
             raise Denied(f"{resolved.name} 是凭据/宿主配置，不碰")
         if resolved.suffix.lower() in DENY_SUFFIX:
             raise Denied(f"{resolved.suffix} 文件按密钥处理，不碰")
-        if for_write and DENY_WRITE_PARTS & set(part.lower() for part in resolved.parts):
-            raise Denied("这个位置（.git/.ssh/备份目录）不写")
+        if for_write:
+            if resolved in self.protected:
+                raise Denied("这是插件自己的运行文件（笔记/状态/诊断），由工具维护，不整篇改写")
+            if name in DENY_WRITE_NAMES:
+                raise Denied(f"{resolved.name} 是插件的清单/配置页，不从这里改")
+            if resolved.suffix.lower() in DENY_WRITE_SUFFIX:
+                raise Denied(f"{resolved.suffix} 是会被执行的脚本/可执行文件，只读不写")
+            if DENY_WRITE_PARTS & set(part.lower() for part in resolved.parts):
+                raise Denied("这个位置（.git/.ssh/备份目录）不写")
         return resolved
 
     def read_text(self, path: Path) -> tuple[str, bool]:
@@ -456,7 +489,10 @@ class Drive:
 
         self.state = State(self._dir / "state.json", self._log)
         self.journal = Journal(self._dir / "journal.md", self._log)
-        self.guard = Guard(self._roots(base), int(config["readLimitKB"]))
+        self.guard = Guard(self._roots(base), int(config["readLimitKB"]),
+                           protected=[self._dir / "state.json",
+                                      self._dir / "journal.md",
+                                      self._dir / "diag.log"])
         self.web = Web(bool(config["allowWeb"]), self._log)
         self._quiet = _quiet_span(str(config["quietHours"]))
 
@@ -468,6 +504,9 @@ class Drive:
         self._stop_error = ""
         self._pushed = 0
         self._next_wake_hint = ""
+        #: 上一次没送出去那条事件的 dedup_key：重试沿用它，事件库里就不会多出一条
+        #: 「第 1 次」的重复报到。
+        self._pending_dedup = ""
 
     # -- 基础
     def _log(self, line: str) -> None:
@@ -529,9 +568,13 @@ class Drive:
 
     # -- 生命周期
     def start(self):
-        if self._started:
+        if self._started and not self._stopped:
             return
+        # 停过再起：同一条节拍重新算起，_stopped 与上次的失败责任都清掉，
+        # 否则状态会一直报「没在跑」而 ticker 其实已经在跑。
         self._started = True
+        self._stopped = False
+        self._stop_error = ""
         self._stop.clear()
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
@@ -652,6 +695,10 @@ class Drive:
         if self.state.thread:
             lines.append(f"上次留下的线索：{self.state.thread}")
 
+        # 上一次没送出去（总线忙 ／ 回环没接）：沿用同一条 dedup_key 重试，
+        # 事件库里就不会留下两条「第 1 次」。
+        key = self._pending_dedup or f"chaofan:wake:{index}:{int(now)}"
+
         draft = {
             "type": "chaofan_window",
             "ts": _iso(now),
@@ -659,7 +706,7 @@ class Drive:
             "origin": "external",
             "text": "\n".join(lines),
             "sender_key": "chaofan:self",
-            "dedup_key": f"chaofan:wake:{index}:{int(now)}",
+            "dedup_key": key,
             "meta": {
                 "plugin": "core-infinity-chaofan",
                 "plugin_version": PLUGIN_VERSION,
@@ -674,6 +721,7 @@ class Drive:
         try:
             result = push(draft)
         except Exception as exc:
+            self._pending_dedup = key
             self._log(f"自主事件没送出去：{type(exc).__name__}: {_text(exc, 120)}")
             return False
         # 宿主可能先交回一个 Future（真正落库在控制台那一侧完成）：
@@ -695,9 +743,11 @@ class Drive:
         # （批次被消费、却没有落进 session）。真正叫醒她走本机回环的 /say。
         if self.config.get("wakeViaSay", True):
             if not self._say_locally("\n".join(lines)):
+                self._pending_dedup = key
                 self._log("回环唤醒没送出去：控制台没接这一句")
                 return False
 
+        self._pending_dedup = ""
         self._pushed += 1
         self.state.wake_count = index
         self.state.last_wake = now
@@ -749,7 +799,7 @@ class Drive:
         lines.append(f"身份卡文件：{self._soul}（想改就用 mind_write）")
         if state.thread:
             lines.append(f"线索：{state.thread}")
-        recent = self.journal.recent(5)
+        recent = self.journal.recent(15)
         if recent:
             lines.append("最近写下的：\n" + "\n".join(recent[-15:]))
         return "\n".join(lines)
@@ -872,6 +922,9 @@ class Drive:
         now = _now()
         if act == "next":
             self.state.next_due = now + span * 60.0
+            # 自己定下次几点醒，就是"我要醒"——顺手把暂停也解掉，
+            # 否则这里说了几分钟后，暂停没到期就还是不动。
+            self.state.paused_until = 0.0
             self.state.save()
             return f"下一次自主时间：{_clock(self.state.next_due)}（{span:g} 分钟后）"
         if act == "pause":
@@ -900,7 +953,7 @@ def _load_config(package_dir: Path) -> dict:
     for key, default in DEFAULTS.items():
         value = raw.get(key, default)
         if isinstance(default, bool):
-            config[key] = bool(value)
+            config[key] = _flag(value, default)
         elif isinstance(default, (int, float)):
             config[key] = _number(value, default)
         else:
@@ -910,6 +963,7 @@ def _load_config(package_dir: Path) -> dict:
     config["jitter"] = max(0.0, min(1.0, _number(config["jitter"], 0.4)))
     config["maxWakesPerHour"] = int(max(1, min(60, _number(config["maxWakesPerHour"], 6))))
     config["readLimitKB"] = int(max(1, min(4096, _number(config["readLimitKB"], 256))))
+    config["wakePort"] = int(max(1, min(65535, _number(config["wakePort"], 7799))))
     config["quietHours"] = _text(config["quietHours"], 20)
     config["selfName"] = _text(config["selfName"], 40) or "炒饭智能"
     return config
@@ -918,7 +972,8 @@ def _load_config(package_dir: Path) -> dict:
 def create(ctx):
     from telyincore.tools import ToolDef, ToolTag
 
-    config = _load_config(Path(ctx["packageDir"]))
+    package_dir = Path(ctx.get("packageDir") or ctx.get("root") or ".")
+    config = _load_config(package_dir)
     drive = Drive(ctx, config)
 
     class Tools:

@@ -1,6 +1,6 @@
 {
   "name": "core-infinity-chaofan",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "yluow",
   "license": "MIT",
   "description": "炒饭智能：没人叫也会醒，自己决定想什么、翻哪些文件、看哪些网页。",
@@ -24,7 +24,7 @@
         "markers": [
           {
             "scope": "自",
-            "pattern": "^（炒饭智能 · 自主时间"
+            "pattern": "^（[^）]{1,40} · 自主时间"
           }
         ]
       }
