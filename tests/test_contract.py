@@ -484,6 +484,49 @@ class WebTests(unittest.TestCase):
                 drive.stop()
 
 
+BING_PAGE = ('<html><body><ol id="b_results">'
+             '<li class="b_algo"><h2><a href="https://www.chaoxibiao.net/">潮汐表，精准潮汐时间表</a></h2>'
+             '<div class="b_caption"><p class="b_lineclamp2">查潮汐就用大鱼潮汐表。</p></div></li>'
+             '<li class="b_algo"><h2><a href="https://zh.tideschart.com/">世界潮汐表</a></h2>'
+             '<div class="b_caption"><p class="b_lineclamp2">五万多个沿海城市。</p></div></li>'
+             '</ol></body></html>')
+
+
+class WebSearchTests(unittest.TestCase):
+    """搜索要能换引擎、要说得清是谁给的、全失败就不假装。"""
+
+    def test_parse_bing_results(self):
+        hits = plugin.Web._parse_bing(BING_PAGE)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0][0], "潮汐表，精准潮汐时间表")
+        self.assertEqual(hits[0][1], "https://www.chaoxibiao.net/")
+        self.assertIn("大鱼潮汐表", hits[0][2])
+
+    def test_search_falls_back_to_bing(self):
+        web = plugin.Web(True, lambda line: None)
+        asked = []
+
+        def fake_open(request):
+            asked.append(request.full_url)
+            if "duckduckgo" in request.full_url:
+                return "<html>被挡了</html>", "text/html"
+            return BING_PAGE, "text/html"
+
+        web._open = fake_open
+        out = web.search("潮汐表")
+        self.assertIn("bing", out)
+        self.assertIn("chaoxibiao.net", out)
+        self.assertEqual(len(asked), 2, asked)
+
+    def test_search_is_honest_when_all_fail(self):
+        web = plugin.Web(True, lambda line: None)
+        web._open = lambda request: ("<html>空的</html>", "text/html")
+        out = web.search("潮汐表")
+        self.assertIn("没查到", out)
+        self.assertIn("duckduckgo", out)
+        self.assertIn("bing", out)
+
+
 class DriveTests(unittest.TestCase):
     def setUp(self):
         self._ctx = workdir()

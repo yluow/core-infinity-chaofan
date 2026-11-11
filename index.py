@@ -1,4 +1,4 @@
-﻿"""自主驱动 —— 让控制台里的她按自己的节奏醒过来，自己决定做什么。
+"""自主驱动 —— 让控制台里的她按自己的节奏醒过来，自己决定做什么。
 
 这个插件只做四件事，其余交给本体：
 
@@ -39,7 +39,7 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.6"
+PLUGIN_VERSION = "0.1.7"
 
 #: 她的名字。写死：名字是身份卡的事，不是配置栏的事（0.1.3 起不再做成一栏）。
 SELF_NAME = "炒饭智能"
@@ -91,6 +91,9 @@ DENY_WRITE_SUFFIX = {".py", ".pyw", ".pyi", ".bat", ".cmd", ".ps1", ".psm1",
 DENY_WRITE_NAMES = {"package.json", "config.schema.json", "config.html"}
 
 _USER_AGENT = f"ChaofanIntelligence/{PLUGIN_VERSION} (+local TelyinCore plugin)"
+#: 搜索用浏览器口径的 UA：引擎会按 UA 直接挡掉"自报门户"的请求。
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 #: 身份卡的初始内容。只在第一次启动、文件不存在时写一次。
 SOUL_SEED = """# 炒饭智能
@@ -434,27 +437,66 @@ class Web:
         body = raw[:WEB_MAX_BYTES].decode(charset, errors="replace")
         return (body + ("\n…（内容超过上限，已截断）" if truncated else "")), ctype
 
+    #: 搜索按顺序试；第一个给出结果的用。DuckDuckGo 在有些网络里被挡，Bing 通常能通。
+    ENGINES = (
+        ("duckduckgo", "https://html.duckduckgo.com/html/?q={q}"),
+        ("bing", "https://www.bing.com/search?q={q}"),
+        ("bing-cn", "https://cn.bing.com/search?q={q}&setlang=zh-CN"),
+    )
+
     def search(self, query: str) -> str:
         if not self.allow:
             return "上网功能是关着的（配置 allowWeb=false），这次没查。"
         needle = _text(query, 200)
         if not needle:
             return "没给搜索词。"
-        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(needle)
-        request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-        try:
-            page, _ctype = self._open(request)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            return f"没连上（{type(exc).__name__}: {_text(exc, 120)}）。不用假装查到了。"
-        hits = self._parse_results(page)
-        if not hits:
-            return "没有结果返回（可能被反爬拦了）。换个说法或再试一次。"
-        lines = [f"「{needle}」的结果（{len(hits)} 条）："]
+        tried = []
+        for engine, template in self.ENGINES:
+            url = template.format(q=urllib.parse.quote(needle))
+            request = urllib.request.Request(url, headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+            try:
+                page, _ctype = self._open(request)
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                tried.append(f"{engine} 没连上（{type(exc).__name__}）")
+                continue
+            hits = (self._parse_bing(page) if engine.startswith("bing")
+                    else self._parse_results(page))
+            if hits:
+                return self._render(needle, hits, engine)
+            tried.append(f"{engine} 没有结果")
+        return "没查到（" + "；".join(tried) + "）。不假装查到了。"
+
+    @staticmethod
+    def _render(needle: str, hits: list[tuple[str, str, str]], engine: str) -> str:
+        lines = [f"「{needle}」的结果（{len(hits)} 条 · {engine}）："]
         for index, (title, link, snippet) in enumerate(hits, 1):
             lines.append(f"{index}. {title}\n   {link}")
             if snippet:
                 lines.append(f"   {snippet}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _parse_bing(page: str) -> list[tuple[str, str, str]]:
+        """Bing 的结果块（`li.b_algo` → `h2 > a`）。摘要能取到就配上。"""
+        hits: list[tuple[str, str, str]] = []
+        for match in re.finditer(
+                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>', page, re.S | re.I):
+            link = _clean_link(match.group(1))
+            title = _html_to_text(match.group(2)).strip()
+            if not link or not title:
+                continue
+            hits.append((title, link, ""))
+            if len(hits) >= 8:
+                break
+        snippets = re.findall(
+            r'<p[^>]+class="[^"]*b_(?:lineclamp|algoSlug)[^"]*"[^>]*>(.*?)</p>', page, re.S | re.I)
+        for index, snippet in enumerate(snippets[:len(hits)]):
+            text = _html_to_text(snippet).strip()
+            if text:
+                hits[index] = (hits[index][0], hits[index][1], _text(text, 200))
+        return hits
 
     @staticmethod
     def _parse_results(page: str) -> list[tuple[str, str, str]]:
