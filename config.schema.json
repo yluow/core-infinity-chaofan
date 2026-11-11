@@ -1,12 +1,6 @@
 {
   "type": "object",
   "properties": {
-    "selfName": {
-      "type": "string",
-      "title": "她的名字",
-      "description": "自称。会出现在每次醒来的标题、状态摘要和事件元数据里。",
-      "default": "炒饭智能"
-    },
     "intervalMinutes": {
       "type": "number",
       "title": "醒来的间隔（分钟）",
@@ -42,7 +36,7 @@
     "quietHours": {
       "type": "string",
       "title": "安静时段",
-      "description": "形如 01:00-07:00；支持跨零点（22:00-08:00）。留空表示不设安静时段。",
+      "description": "配置页上是两个时间下拉栏（开始 / 结束），支持跨零点；选「不设」就任何时间都可能醒。存成 01:00-07:00 这样的写法。",
       "default": "01:00-07:00"
     },
     "allowWeb": {
@@ -64,20 +58,6 @@
       "default": 256,
       "minimum": 1,
       "maximum": 4096
-    },
-    "wakeViaSay": {
-      "type": "boolean",
-      "title": "用本机回环叫醒",
-      "description": "开着：到点把这句话递进控制台输入队列（真正叫醒她）；关掉：只写事件库。",
-      "default": true
-    },
-    "wakePort": {
-      "type": "integer",
-      "title": "控制台端口",
-      "description": "回环唤醒要投递到的本机端口（与控制台页一致，默认 7799）。",
-      "default": 7799,
-      "minimum": 1,
-      "maximum": 65535
     }
   }
 }

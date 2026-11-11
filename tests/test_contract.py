@@ -107,7 +107,7 @@ def make_ctx(tmp: Path, **kwargs) -> FakeCtx:
 def make_drive(ctx: FakeCtx, **overrides) -> "plugin.Drive":
     config = dict(plugin.DEFAULTS)
     config.update({"firstDelayMinutes": 0, "jitter": 0, "quietHours": "",
-                   "intervalMinutes": 1, "wakeViaSay": False})
+                   "intervalMinutes": 1})
     config.update(overrides)
     drive = plugin.Drive(ctx, config)
     drive.start()
@@ -147,14 +147,14 @@ class ManifestTests(unittest.TestCase):
             self.assertTrue(str(target).startswith(str(root)), f"{key} 越界: {target}")
             self.assertTrue(target.is_file(), f"{key} 不存在: {target}")
 
-    def test_channel_marker_matches_renamed_self(self):
-        """自称可配（selfName），渠道标记就不能写死一个名字。"""
+    def test_channel_marker_matches_the_wake_header(self):
+        """渠道标记要认得出事件头（名字是插件自己的，不是配置项）。"""
         meta = self.manifest["telyincore"]
         pattern = meta["channels"][0]["markers"][0]["pattern"]
         marker = re.compile(pattern)
         with workdir() as tmp:
             ctx = make_ctx(tmp)
-            drive = make_drive(ctx, selfName="小炒")
+            drive = make_drive(ctx)
             try:
                 drive.state.next_due = time.time() - 1
                 drive._tick(time.time())
@@ -162,6 +162,7 @@ class ManifestTests(unittest.TestCase):
                 drive.stop()
         first = ctx.events[0]["text"].splitlines()[0]
         self.assertTrue(marker.search(first), f"{pattern!r} 认不出 {first!r}")
+        self.assertIn(plugin.SELF_NAME, first)
 
 
 class ConfigPageTests(unittest.TestCase):
@@ -182,6 +183,15 @@ class ConfigPageTests(unittest.TestCase):
                       "telyincore:config:save", "telyincore:config:state",
                       "telyincore:config:saved", "revision"):
             self.assertIn(token, self.html)
+
+    def test_quiet_hours_is_two_time_selects(self):
+        """安静时段在页面上是两个时间下拉栏，不是一个手填的字符串。"""
+        self.assertIn("QUIET_FIELD = 'quietHours'", self.html)
+        self.assertIn("function buildQuiet(", self.html)
+        self.assertIn("createElement('select')", self.html)
+        self.assertIn("timeOptions(", self.html)
+        # 名字不再是配置项：页面里不该再有它的特殊分支
+        self.assertNotIn("selfName", self.html)
 
 
 class SchemaTests(unittest.TestCase):
@@ -208,30 +218,34 @@ class SchemaTests(unittest.TestCase):
         self.assertLessEqual(config["jitter"], 1)
         self.assertIsInstance(config["allowWeb"], bool)
 
-    def test_wake_keys_survive_config_json(self):
-        """0.1.1 的漏项：schema 里有、DEFAULTS 里没有 ⇒ 页面上关了也不生效。"""
-        with workdir() as tmp:
-            (tmp / "config.json").write_text(
-                json.dumps({"wakeViaSay": False, "wakePort": 8123}), encoding="utf-8")
-            config = plugin._load_config(tmp)
-            self.assertIs(config["wakeViaSay"], False)
-            self.assertEqual(config["wakePort"], 8123)
-
-    def test_wake_port_is_clamped(self):
-        with workdir() as tmp:
-            for raw, want in ((99999, 65535), (0, 1), ("不是数字", 7799)):
-                (tmp / "config.json").write_text(
-                    json.dumps({"wakePort": raw}), encoding="utf-8")
-                self.assertEqual(plugin._load_config(tmp)["wakePort"], want, raw)
-
     def test_boolean_written_as_text_is_read(self):
         """手改的 config.json 常把开关写成 "false" ／ 0，不能读成真。"""
         with workdir() as tmp:
             (tmp / "config.json").write_text(
-                json.dumps({"allowWeb": "false", "wakeViaSay": 0}), encoding="utf-8")
+                json.dumps({"allowWeb": "false"}), encoding="utf-8")
+            self.assertIs(plugin._load_config(tmp)["allowWeb"], False)
+            (tmp / "config.json").write_text(
+                json.dumps({"allowWeb": 0}), encoding="utf-8")
+            self.assertIs(plugin._load_config(tmp)["allowWeb"], False)
+
+    def test_name_is_not_a_config_field(self):
+        """名字是身份卡的事，不再做成配置栏；config.json 里写了也不作数。"""
+        self.assertNotIn("selfName", self.schema["properties"])
+        self.assertNotIn("selfName", self.example)
+        self.assertNotIn("selfName", plugin.DEFAULTS)
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(
+                json.dumps({"selfName": "小炒"}), encoding="utf-8")
+            drive = plugin.Drive(make_ctx(tmp), plugin._load_config(tmp))
+            self.assertEqual(drive.name, plugin.SELF_NAME)
+
+    def test_quiet_hours_wire_format_is_still_a_span(self):
+        """页面是两个下拉栏，存下来仍是 HH:MM-HH:MM：插件这边不用改解析。"""
+        with workdir() as tmp:
+            (tmp / "config.json").write_text(
+                json.dumps({"quietHours": "22:00-08:00"}), encoding="utf-8")
             config = plugin._load_config(tmp)
-            self.assertIs(config["allowWeb"], False)
-            self.assertIs(config["wakeViaSay"], False)
+            self.assertEqual(plugin._quiet_span(config["quietHours"]), (1320, 480))
 
 
 class QuietTests(unittest.TestCase):
@@ -519,45 +533,74 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(self.drive.state.paused_until, 0.0)
 
     def test_retry_reuses_dedup_key(self):
-        """桥没送出去要重试；重试不能变成第二条「第 1 次」报到。"""
+        """没报到成功要重试；重试不能变成第二条「第 1 次」报到。"""
         with workdir() as tmp:
             ctx = make_ctx(tmp)
-            drive = make_drive(ctx, wakeViaSay=True)      # 这条路要开着才谈得上"桥失败"
-            calls = []
-            drive._say_locally = lambda text: calls.append(text) or False
+            drive = make_drive(ctx)
+            ctx.push_error = RuntimeError("总线忙")
             try:
                 drive.state.next_due = time.time() - 1
                 drive._tick(time.time())
-                first = ctx.events[0]["dedup_key"]
                 self.assertEqual(drive.state.wake_count, 0)
+                self.assertEqual(ctx.events, [])
 
-                drive._say_locally = lambda text: True
+                ctx.push_error = None
                 drive.state.next_due = time.time() - 1
                 drive._tick(time.time())
             finally:
                 drive.stop()
-        self.assertEqual(ctx.events[1]["dedup_key"], first)
+        self.assertTrue(ctx.events[0]["dedup_key"].startswith("chaofan:wake:1:"),
+                        ctx.events[0]["dedup_key"])
         self.assertEqual(drive.state.wake_count, 1)
 
-    def test_wake_off_takes_no_say_path(self):
-        """config.json 里关掉回环：不碰 /say，事件照样报到。"""
+    def test_retry_after_failed_push_keeps_first_key(self):
+        """推出去过但宿主拒收（Future 异常）：重试沿用它，库里不多一条。"""
         with workdir() as tmp:
-            (tmp / "config.json").write_text(json.dumps({
-                "wakeViaSay": False, "firstDelayMinutes": 0,
-                "intervalMinutes": 1, "jitter": 0, "quietHours": ""}), encoding="utf-8")
             ctx = make_ctx(tmp)
-            ctx["packageDir"] = str(tmp)
-            drive = plugin.Drive(ctx, plugin._load_config(tmp))
-            drive.start()
-            calls = []
-            drive._say_locally = lambda text: calls.append(text) or True
+            drive = make_drive(ctx)
+            seen = []
+
+            def flaky(draft):
+                seen.append(draft["dedup_key"])
+                if len(seen) == 1:
+                    raise RuntimeError("第一下没接住")
+
+            ctx._push = flaky          # FakeCtx.get 每次都回 _push，替换即是换实现
             try:
-                drive.state.next_due = 0
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+                drive.state.next_due = time.time() - 1
                 drive._tick(time.time())
             finally:
                 drive.stop()
-            self.assertEqual(calls, [])
-            self.assertEqual(len(ctx.events), 1)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
+
+    def test_wake_never_touches_the_console_input(self):
+        """不拿用户的输入框当传声筒：到点只写事件库，一个 HTTP 请求都不发。"""
+        import urllib.request as urlreq
+        touched = []
+
+        def forbidden(request, *args, **kwargs):
+            touched.append(getattr(request, "full_url", request))
+            raise AssertionError("插件不该往控制台输入口发东西")
+
+        original = urlreq.urlopen
+        urlreq.urlopen = forbidden
+        try:
+            with workdir() as tmp:
+                ctx = make_ctx(tmp)
+                drive = make_drive(ctx)
+                try:
+                    self.assertFalse(hasattr(drive, "_say_locally"))
+                    drive.state.next_due = time.time() - 1
+                    drive._tick(time.time())
+                finally:
+                    drive.stop()
+        finally:
+            urlreq.urlopen = original
+        self.assertEqual(touched, [])
+        self.assertEqual(len(ctx.events), 1)
 
 
 class IdentityTests(unittest.TestCase):
@@ -581,17 +624,17 @@ class IdentityTests(unittest.TestCase):
             finally:
                 again.stop()
 
-    def test_custom_name_reaches_event_and_status(self):
+    def test_name_is_fixed_and_reaches_event_and_status(self):
         with workdir() as tmp:
             ctx = make_ctx(tmp)
-            drive = make_drive(ctx, selfName="小炒")
+            drive = make_drive(ctx)          # 配置里没有名字这一栏了
             try:
                 drive.state.next_due = time.time() - 1
                 drive._tick(time.time())
                 event = ctx.events[0]
-                self.assertIn("小炒", event["text"])
-                self.assertEqual(event["meta"]["self_name"], "小炒")
-                self.assertIn("小炒", drive.status_text())
+                self.assertIn(plugin.SELF_NAME, event["text"])
+                self.assertEqual(event["meta"]["self_name"], plugin.SELF_NAME)
+                self.assertIn(plugin.SELF_NAME, drive.status_text())
             finally:
                 drive.stop()
 
@@ -606,82 +649,6 @@ class IdentityTests(unittest.TestCase):
                 drive.stop()
 
 
-
-class WakeBridgeTests(unittest.TestCase):
-    """回环唤醒：这条路是"真正叫醒她"的那一步，压行与失败都要如实。"""
-
-    def test_say_flattens_to_one_line(self):
-        import io
-        import urllib.request as urlreq
-        captured = {}
-
-        class FakeResponse:
-            status = 202
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        def fake_urlopen(request, timeout=0):
-            captured["data"] = request.data
-            captured["origin"] = request.get_header("Origin")
-            return FakeResponse()
-
-        original = urlreq.urlopen
-        urlreq.urlopen = fake_urlopen
-        try:
-            with workdir() as tmp:
-                drive = make_drive(make_ctx(tmp), wakeViaSay=True, wakePort=7799)
-                try:
-                    ok = drive._say_locally("第一行\n第二行\n\n第三行")
-                finally:
-                    drive.stop()
-        finally:
-            urlreq.urlopen = original
-
-        self.assertTrue(ok)
-        body = captured["data"].decode("utf-8")
-        self.assertNotIn("\n", body)
-        self.assertIn("第一行", body)
-        self.assertIn("第三行", body)
-        self.assertEqual(captured["origin"], "http://127.0.0.1:7799")
-
-    def test_say_failure_is_reported_not_swallowed(self):
-        import urllib.request as urlreq
-
-        def boom(request, timeout=0):
-            raise OSError("控制台没起来")
-
-        original = urlreq.urlopen
-        urlreq.urlopen = boom
-        try:
-            with workdir() as tmp:
-                drive = make_drive(make_ctx(tmp), wakeViaSay=True)
-                try:
-                    ok = drive._say_locally("一句话")
-                finally:
-                    drive.stop()
-        finally:
-            urlreq.urlopen = original
-
-        self.assertFalse(ok)
-        self.assertTrue(any("回环" in line for line in drive._log_lines) or True)
-
-    def test_emit_requires_bridge_success(self):
-        with workdir() as tmp:
-            ctx = make_ctx(tmp)
-            drive = make_drive(ctx, wakeViaSay=True)
-            calls = []
-            drive._say_locally = lambda text: calls.append(text) or False
-            try:
-                drive.state.next_due = time.time() - 1
-                drive._tick(time.time())
-            finally:
-                drive.stop()
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(drive.state.wake_count, 0, "桥没送出去就不算给了一段时间")
 
 class StopTests(unittest.TestCase):
     def test_stop_joins_and_is_idempotent(self):

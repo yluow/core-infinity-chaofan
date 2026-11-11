@@ -39,7 +39,10 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
+
+#: 她的名字。写死：名字是身份卡的事，不是配置栏的事（0.1.3 起不再做成一栏）。
+SELF_NAME = "炒饭智能"
 
 #: 所有工具的统一前缀（清单里声明，测试里断言）。
 TOOL_PREFIX = "mind_"
@@ -52,7 +55,6 @@ WEB_TIMEOUT = 12.0
 WEB_MAX_BYTES = 2 * 1024 * 1024
 
 DEFAULTS = {
-    "selfName": "炒饭智能",
     "intervalMinutes": 15.0,
     "firstDelayMinutes": 2.0,
     "jitter": 0.4,
@@ -61,10 +63,6 @@ DEFAULTS = {
     "allowWeb": True,
     "rootList": "",
     "readLimitKB": 256,
-    # 这两个是 0.1.1 的漏项：schema 里有、配置页上也画得出来，但读取时不认，
-    # 于是"关掉回环叫醒"关不掉。放进 DEFAULTS 才进得了 _load_config 的那一圈。
-    "wakeViaSay": True,
-    "wakePort": 7799,
 }
 
 #: 永远不给读/写的东西：凭据与宿主配置。
@@ -526,8 +524,8 @@ class Drive:
 
     @property
     def name(self) -> str:
-        """她的名字：配置里的自称，默认「炒饭智能」。"""
-        return _text(self.config.get("selfName"), 40) or "炒饭智能"
+        """她的名字（写死，不再从配置读）。"""
+        return SELF_NAME
 
     def _seed_soul(self) -> None:
         """第一次启动写身份卡；已有就一个字不动。"""
@@ -632,7 +630,7 @@ class Drive:
                 self._log(f"自主驱动停止未完成：{self._stop_error}")
                 return
         self._receipt = None
-        self._log(f"{self.name} 已停止（本次共给了 {self._pushed} 段自主时间）")
+        self._log(f"{self.name} 已停止（本次共报到 {self._pushed} 次）")
 
     # -- 循环
     def _loop(self):
@@ -695,7 +693,7 @@ class Drive:
         if self.state.thread:
             lines.append(f"上次留下的线索：{self.state.thread}")
 
-        # 上一次没送出去（总线忙 ／ 回环没接）：沿用同一条 dedup_key 重试，
+        # 上一次没送出去（总线忙 ／ 宿主还没接上）：沿用同一条 dedup_key 重试，
         # 事件库里就不会留下两条「第 1 次」。
         key = self._pending_dedup or f"chaofan:wake:{index}:{int(now)}"
 
@@ -739,43 +737,14 @@ class Drive:
             except Exception:
                 pass
 
-        # 事件进库只算"报到"：这个构建里控制台不会因插件事件进入会话
-        # （批次被消费、却没有落进 session）。真正叫醒她走本机回环的 /say。
-        if self.config.get("wakeViaSay", True):
-            if not self._say_locally("\n".join(lines)):
-                self._pending_dedup = key
-                self._log("回环唤醒没送出去：控制台没接这一句")
-                return False
-
+        # 只报到，不代她开口：不碰控制台的输入框，也不替她发任何一句（0.1.3 起
+        # 连回环 /say 也去掉了 —— 那是拿用户自己的输入行当传声筒）。
         self._pending_dedup = ""
         self._pushed += 1
         self.state.wake_count = index
         self.state.last_wake = now
         self.state.wakes.append(now)
         return True
-
-    def _say_locally(self, text: str) -> bool:
-        """把这一句递进控制台自己的输入队列（本机回环，同源头）。
-
-        这是"叫她"的那一步：/say 走的是用户输入那条路，她一定会被唤起；
-        推事件只留作记录（当前构建不会因此进会话）。
-        """
-        import urllib.request as _u
-        # 控制台那条进口只收"一行"：多行会被 400 拒掉，这里压成一句。
-        text = "；".join(_text(part, 300) for part in str(text).splitlines() if part.strip())
-        if not text:
-            return False
-        port = int(self.config.get("wakePort", 7799) or 7799)
-        origin = f"http://127.0.0.1:{port}"
-        request = _u.Request(f"{origin}/say", data=text.encode("utf-8"), method="POST",
-                             headers={"Content-Type": "text/plain; charset=utf-8",
-                                      "Origin": origin, "Referer": origin + "/"})
-        try:
-            with _u.urlopen(request, timeout=10) as response:
-                return 200 <= int(response.status) < 300
-        except Exception as exc:
-            self._log(f"回环 /say 失败：{type(exc).__name__}: {_text(exc, 120)}")
-            return False
 
     # -- 给她看的摘要
     def status_text(self) -> str:
@@ -963,9 +932,7 @@ def _load_config(package_dir: Path) -> dict:
     config["jitter"] = max(0.0, min(1.0, _number(config["jitter"], 0.4)))
     config["maxWakesPerHour"] = int(max(1, min(60, _number(config["maxWakesPerHour"], 6))))
     config["readLimitKB"] = int(max(1, min(4096, _number(config["readLimitKB"], 256))))
-    config["wakePort"] = int(max(1, min(65535, _number(config["wakePort"], 7799))))
     config["quietHours"] = _text(config["quietHours"], 20)
-    config["selfName"] = _text(config["selfName"], 40) or "炒饭智能"
     return config
 
 

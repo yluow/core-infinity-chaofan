@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -18,9 +18,13 @@
   .field{margin:0 0 18px}
   label{display:block;font-size:12px;font-weight:600;margin-bottom:5px}
   .desc{color:var(--muted);font-size:12px;margin:5px 0 0}
-  input[type=text],input[type=number]{width:100%;padding:7px 9px;border:1px solid var(--line);
+  input[type=text],input[type=number],select{width:100%;padding:7px 9px;border:1px solid var(--line);
       border-radius:7px;background:var(--bg);color:var(--ink);font:inherit;font-size:13px}
-  input:focus{outline:2px solid var(--blue);outline-offset:1px;border-color:transparent}
+  input:focus,select:focus{outline:2px solid var(--blue);outline-offset:1px;border-color:transparent}
+  .pair{display:flex;gap:8px;align-items:center}
+  .pair select{width:auto;min-width:96px;flex:0 0 auto}
+  .pair .dash{color:var(--muted);font-size:13px}
+  .pair select:disabled{opacity:.45}
   .row{display:flex;gap:10px;align-items:center;margin-top:20px;flex-wrap:wrap}
   button{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:7px;
       padding:6px 14px;font:inherit;font-size:13px;cursor:pointer}
@@ -60,8 +64,12 @@
 
   var revision = null;      // 权威版本号：只来自宿主回执
   var fields = [];          // 最新一次读取到的字段声明
-  var inputs = [];          // {path, el, original}
+  var inputs = [];          // {path, el, original, field, read?}
   var busy = false;
+
+  // 安静时段：一栏两个时间下拉（开始 / 结束），存成 HH:MM-HH:MM。
+  var QUIET_FIELD = 'quietHours';
+  var STEP_MIN = 15;
 
   function say(text, tone) {
     statusEl.textContent = text;
@@ -72,6 +80,50 @@
 
   function isPrivate(field) {
     return field.format === 'password' || field.writeOnly === true;
+  }
+
+  function isQuiet(field) {
+    return field.path.length === 1 && field.path[0] === QUIET_FIELD;
+  }
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hhmm(minutes) { return pad(Math.floor(minutes / 60)) + ':' + pad(minutes % 60); }
+
+  function minutesOf(text) {
+    var hit = /^(\d{1,2}):(\d{2})$/.exec(String(text == null ? '' : text).trim());
+    if (!hit) return null;
+    var hour = Number(hit[1]), minute = Number(hit[2]);
+    if (!isFinite(hour) || !isFinite(minute) || hour > 23 || minute > 59) return null;
+    return hour * 60 + minute;
+  }
+
+  function parseQuiet(value) {
+    var parts = String(value == null ? '' : value).trim().split('-');
+    if (parts.length !== 2) return { start: null, end: null };
+    var start = minutesOf(parts[0]), end = minutesOf(parts[1]);
+    if (start === null || end === null || start === end) return { start: null, end: null };
+    return { start: start, end: end };
+  }
+
+  function quietText(parsed) {
+    return parsed.start === null ? '' : hhmm(parsed.start) + '-' + hhmm(parsed.end);
+  }
+
+  function timeOptions(selected) {
+    var values = [];
+    for (var minute = 0; minute < 24 * 60; minute += STEP_MIN) values.push(minute);
+    if (selected !== null && values.indexOf(selected) < 0) {
+      values.push(selected);                       // 盘上是 01:07 这种不整齐的值也照原样显示
+      values.sort(function (a, b) { return a - b; });
+    }
+    var out = '';
+    for (var i = 0; i < values.length; i += 1) {
+      var text = hhmm(values[i]);
+      out += '<option value="' + text + '"' +
+             (selected !== null && values[i] === selected ? ' selected' : '') +
+             '>' + text + '</option>';
+    }
+    return out;
   }
 
   function num(el) {
@@ -90,6 +142,63 @@
     return el.value;
   }
 
+  function buildQuiet(field, id) {
+    var parsed = parseQuiet(field.value);
+    var box = document.createElement('div');
+    box.className = 'pair';
+
+    var start = document.createElement('select');
+    start.id = id + '-start';
+    start.setAttribute('aria-label', '安静时段开始');
+    start.innerHTML = '<option value="">（不设）</option>' + timeOptions(parsed.start);
+
+    var dash = document.createElement('span');
+    dash.className = 'dash';
+    dash.textContent = '—';
+
+    var end = document.createElement('select');
+    end.id = id + '-end';
+    end.setAttribute('aria-label', '安静时段结束');
+    end.innerHTML = timeOptions(parsed.end === null ? 7 * 60 : parsed.end);
+
+    var hint = document.createElement('p');
+    hint.className = 'desc';
+
+    function sync() {
+      var off = start.value === '';
+      end.disabled = off;
+      if (off) {
+        hint.textContent = '不设：她任何时间都可能醒。';
+        return;
+      }
+      if (start.value === end.value) {
+        hint.textContent = '起止相同 ＝ 不设，保存后不限制时间。';
+        return;
+      }
+      hint.textContent = '安静时段 ' + start.value + ' – ' + end.value +
+                        (start.value > end.value ? '（跨零点）' : '') + '。';
+    }
+
+    start.addEventListener('change', function () { sync(); refresh(); });
+    end.addEventListener('change', function () { sync(); refresh(); });
+    sync();
+
+    box.appendChild(start);
+    box.appendChild(dash);
+    box.appendChild(end);
+
+    return {
+      box: box,
+      hint: hint,
+      el: start,
+      original: quietText(parsed),
+      read: function () {
+        if (start.value === '' || start.value === end.value) return '';
+        return start.value + '-' + end.value;
+      }
+    };
+  }
+
   function build(state) {
     var incoming = Array.isArray(state.fields) ? state.fields : [];
     var outer = document.createElement('div');
@@ -104,6 +213,17 @@
       label.textContent = field.title || field.path[field.path.length - 1];
       var id = 'f-' + field.path.join('-').replace(/[^A-Za-z0-9_-]/g, '_');
       label.setAttribute('for', id);
+
+      if (isQuiet(field)) {
+        var pair = buildQuiet(field, id);
+        wrap.appendChild(label);
+        wrap.appendChild(pair.box);
+        wrap.appendChild(pair.hint);
+        outer.appendChild(wrap);
+        inputs.push({path: field.path, el: pair.el, original: pair.original,
+                     field: field, read: pair.read});
+        return;
+      }
 
       var el;
       if (field.type === 'boolean') {
@@ -156,6 +276,11 @@
     var out = [];
     inputs.forEach(function (item) {
       var f = item.field;
+      if (item.read) {                              // 安静时段：两个下拉合成一句
+        var composed = item.read();
+        if (composed !== item.original) out.push({path: item.path, value: composed});
+        return;
+      }
       if (isPrivate(f)) {
         if (item.el.value === '') return;           // 空 = 保留原值
         out.push({path: item.path, value: item.el.value});
