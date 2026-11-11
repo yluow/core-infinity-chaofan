@@ -39,7 +39,7 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.4"
+PLUGIN_VERSION = "0.1.5"
 
 #: 她的名字。写死：名字是身份卡的事，不是配置栏的事（0.1.3 起不再做成一栏）。
 SELF_NAME = "炒饭智能"
@@ -65,6 +65,8 @@ DEFAULTS = {
     "allowWeb": True,
     "rootList": "",
     "readLimitKB": 256,
+    # 到点要不要请宿主跑一次「内部唤醒」（0.1.5 起宿主给 request_wake 才有得用）。
+    "useHostWake": True,
 }
 
 #: 永远不给读/写的东西：凭据与宿主配置。
@@ -340,6 +342,8 @@ class State:
         self.last_active = 0.0
         self.wake_count = 0
         self.last_wake = 0.0
+        #: 最近一次"叫醒"的结果（成没成、为什么）——`mind_status` 照实显示。
+        self.wake_note = ""
 
     def load(self) -> None:
         with self._lock:
@@ -355,6 +359,7 @@ class State:
             self.last_active = _number(raw.get("last_active"), 0.0)
             self.wake_count = int(_number(raw.get("wake_count"), 0))
             self.last_wake = _number(raw.get("last_wake"), 0.0)
+            self.wake_note = _text(raw.get("wake_note"), 200)
 
     def save(self) -> None:
         with self._lock:
@@ -363,7 +368,8 @@ class State:
                        "wakes": self.wakes[-64:], "thread": self.thread,
                        "last_active": self.last_active,
                        "wake_count": self.wake_count,
-                       "last_wake": self.last_wake}
+                       "last_wake": self.last_wake,
+                       "wake_note": self.wake_note}
             if not _atomic_json(self._path, payload):
                 self._log("自主状态写盘失败：下次醒来时间可能回退到旧值")
 
@@ -743,6 +749,7 @@ class Drive:
                 "thread": self.state.thread,
                 "hour_wakes": self._wakes_last_hour(now),
                 "conversation": "self:chaofan",
+                "useHostWake": bool(self.config.get("useHostWake", True)),
             },
         }
         try:
@@ -766,14 +773,35 @@ class Drive:
             except Exception:
                 pass
 
-        # 只报到，不代她开口：不碰控制台的输入框，也不替她发任何一句（0.1.3 起
-        # 连回环 /say 也去掉了 —— 那是拿用户自己的输入行当传声筒）。
+        # 叫醒那一步（0.1.5）：请宿主跑一次**内部唤醒** —— 不写输入行、不冒她的名，
+        # 过不过闸由宿主说了算。没给 / 没过闸都说清楚，不假装叫过。
+        note = self._ask_host_to_wake("\n".join(lines))
+        if not note.startswith("叫醒了"):
+            self._log(f"这一拍没叫醒：{note}")
+        self.state.wake_note = note
         self._pending_dedup = ""
         self._pushed += 1
         self.state.wake_count = index
         self.state.last_wake = now
         self.state.wakes.append(now)
         return True
+
+    def _ask_host_to_wake(self, text: str) -> str:
+        """请宿主跑一次内部唤醒；回一句人话（成没成、为什么）。"""
+        if not self.config.get("useHostWake", True):
+            return "配置关了宿主唤醒（useHostWake=false）"
+        wake = self.ctx.get("request_wake")
+        if not callable(wake):
+            return "宿主没给 request_wake（这一构建只能报到，叫不醒）"
+        try:
+            answer = wake(text)
+        except Exception as exc:                      # noqa: BLE001 —— 宿主那边炸了也算没叫醒
+            return f"请求唤醒出错：{type(exc).__name__}: {_text(exc, 120)}"
+        if isinstance(answer, dict):
+            if answer.get("ok"):
+                return "叫醒了（宿主内部唤醒）"
+            return "没叫醒：" + _text(answer.get("why") or "宿主没说原因", 160)
+        return "叫醒了（宿主内部唤醒）" if answer else "没叫醒：宿主回了否"
 
     # -- 给她看的摘要
     def status_text(self) -> str:
@@ -791,6 +819,7 @@ class Drive:
                      f"（上限 {int(self.config['maxWakesPerHour'])}）")
         lines.append(f"安静时段：{self.config['quietHours'] or '无'}；上网：{'开' if self.config['allowWeb'] else '关'}")
         lines.append(f"可翻阅：{'; '.join(str(root) for root in self.guard.roots)}")
+        lines.append(f"最近一次叫醒：{state.wake_note or '还没叫过'}")
         soul = self._soul_lines(2)
         if soul:
             lines.append("身份卡：" + " / ".join(soul))

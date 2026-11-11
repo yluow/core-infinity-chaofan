@@ -5,6 +5,7 @@
   "maxWakesPerHour": 6,
   "quietStart": "01:00",
   "quietEnd": "07:00",
+  "useHostWake": true,
   "allowWeb": true,
   "rootList": "",
   "readLimitKB": 256

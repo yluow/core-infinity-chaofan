@@ -55,15 +55,20 @@ import index as plugin  # noqa: E402
 class FakeCtx(dict):
     """够用的宿主替身：只给本插件真会用到的键。"""
 
-    def __init__(self, package_dir: Path, root: Path, with_host_thread: bool = False):
+    def __init__(self, package_dir: Path, root: Path, with_host_thread: bool = False,
+                 with_wake: bool = False):
         super().__init__(packageDir=str(package_dir), root=str(root), name="demo")
         self.logs: list[str] = []
         self.events: list[dict] = []
+        self.wakes: list[str] = []
+        self.wake_answer = {"ok": True, "why": "model_lane_available"}
         self.push_error: Exception | None = None
         self.with_host_thread = with_host_thread
         self.registered: list[threading.Thread] = []
         if with_host_thread:
             self["start_background_thread"] = self._start_background_thread
+        if with_wake:
+            self["request_wake"] = self._request_wake
 
     def get(self, key, default=None):
         if key == "log":
@@ -76,6 +81,10 @@ class FakeCtx(dict):
         if self.push_error is not None:
             raise self.push_error
         self.events.append(draft)
+
+    def _request_wake(self, text: str) -> dict:
+        self.wakes.append(text)
+        return self.wake_answer
 
     def _start_background_thread(self, thread, stop=None):
         self.registered.append(thread)
@@ -644,6 +653,76 @@ class DriveTests(unittest.TestCase):
             urlreq.urlopen = original
         self.assertEqual(touched, [])
         self.assertEqual(len(ctx.events), 1)
+
+
+class HostWakeTests(unittest.TestCase):
+    """到点请宿主跑一次内部唤醒（0.1.5）：成、不成、没这口子，都要有据可查。"""
+
+    def test_window_asks_the_host_to_wake(self):
+        with workdir() as tmp:
+            ctx = make_ctx(tmp, with_wake=True)
+            drive = make_drive(ctx)
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+            self.assertEqual(len(ctx.wakes), 1)
+            self.assertIn("自主时间", ctx.wakes[0])
+            self.assertTrue(drive.state.wake_note.startswith("叫醒了"), drive.state.wake_note)
+            self.assertEqual(len(ctx.events), 1)
+            self.assertTrue(ctx.events[0]["meta"]["useHostWake"])
+
+    def test_refusal_is_recorded_not_hidden(self):
+        with workdir() as tmp:
+            ctx = make_ctx(tmp, with_wake=True)
+            ctx.wake_answer = {"ok": False, "why": "刚有人说过话（安静了 1 分钟）"}
+            drive = make_drive(ctx)
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+            self.assertEqual(drive.state.wake_note,
+                             "没叫醒：刚有人说过话（安静了 1 分钟）")
+            self.assertTrue(any("没叫醒" in line for line in ctx.logs), ctx.logs)
+            self.assertEqual(len(ctx.events), 1, "叫醒没成功也要留事件")
+            self.assertEqual(drive.state.wake_count, 1)
+
+    def test_missing_hook_degrades_honestly(self):
+        with workdir() as tmp:
+            ctx = make_ctx(tmp)                      # 没有 request_wake
+            drive = make_drive(ctx)
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+            self.assertIn("宿主没给 request_wake", drive.state.wake_note)
+            self.assertEqual(len(ctx.events), 1)
+
+    def test_switch_off_skips_the_call(self):
+        with workdir() as tmp:
+            ctx = make_ctx(tmp, with_wake=True)
+            drive = make_drive(ctx, useHostWake=False)
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+            finally:
+                drive.stop()
+            self.assertEqual(ctx.wakes, [])
+            self.assertIn("配置关了", drive.state.wake_note)
+
+    def test_status_reports_the_last_attempt(self):
+        with workdir() as tmp:
+            drive = make_drive(make_ctx(tmp, with_wake=True))
+            try:
+                drive.state.next_due = time.time() - 1
+                drive._tick(time.time())
+                text = drive.status_text()
+            finally:
+                drive.stop()
+            self.assertIn("最近一次叫醒：叫醒了", text)
 
 
 class IdentityTests(unittest.TestCase):
