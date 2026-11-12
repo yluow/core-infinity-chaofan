@@ -259,6 +259,13 @@ class SchemaTests(unittest.TestCase):
                 json.dumps({"quietHours": "23:30-06:30"}), encoding="utf-8")
             self.assertEqual(plugin._load_config(tmp)["quietHours"], "23:30-06:30")
 
+    def test_load_config_accepts_a_file_path(self):
+        with workdir() as tmp:
+            path = tmp / "cfg.json"
+            path.write_text(json.dumps({"quietStart": "22:00", "quietEnd": "08:00"}),
+                            encoding="utf-8")
+            self.assertEqual(plugin._load_config(path)["quietHours"], "22:00-08:00")
+
     def test_config_json_with_bom_still_loads(self):
         """Windows 那头存出来的 config.json 带 BOM：不能因此整份当成没有。"""
         with workdir() as tmp:
@@ -399,6 +406,24 @@ class CreateTests(unittest.TestCase):
             self.assertEqual(threading.active_count(), before)
             self.assertEqual(list(tmp.rglob("*")), [])
             self.assertTrue(callable(instance.start) and callable(instance.stop))
+
+    def test_plugin_config_path_wins_over_package_dir(self):
+        """控制台存的是每个 Bot 那份 config.json（`pluginConfigPath`），不是插件目录里那份。"""
+        with workdir() as tmp:
+            pkg = tmp / "pkg"
+            pkg.mkdir()
+            (pkg / "config.json").write_text(
+                json.dumps({"quietStart": "不设", "quietEnd": "不设"}), encoding="utf-8")
+            bot_cfg = tmp / "bot.json"
+            bot_cfg.write_text(
+                json.dumps({"quietStart": "09:00", "quietEnd": "18:00"}), encoding="utf-8")
+            ctx = make_ctx(tmp)
+            ctx["packageDir"] = str(pkg)
+            ctx["pluginConfigPath"] = str(bot_cfg)
+            instance = plugin.create(ctx)
+            status = {tool.name: tool.handler for tool in instance.tools()}["mind_status"]()
+            instance.stop()
+            self.assertIn("09:00-18:00", status)
 
     def test_tools_are_prefixed(self):
         with workdir() as tmp:
@@ -713,8 +738,8 @@ class HostWakeTests(unittest.TestCase):
             self.assertEqual(len(ctx.wakes), 1)
             self.assertIn("自主时间", ctx.wakes[0])
             self.assertTrue(drive.state.wake_note.startswith("递过去了"), drive.state.wake_note)
-            self.assertEqual(len(ctx.events), 1)
-            self.assertTrue(ctx.events[0]["meta"]["useHostWake"])
+            # 递过去了就只留内部那一轮：不再往事件库记一条，否则经历里同一次显示两条
+            self.assertEqual(ctx.events, [])
 
     def test_refusal_is_recorded_not_hidden(self):
         with workdir() as tmp:
@@ -727,7 +752,7 @@ class HostWakeTests(unittest.TestCase):
             finally:
                 drive.stop()
             self.assertEqual(drive.state.wake_note,
-                             "没递过去：刚有人说过话（安静了 1 分钟）")
+                             "没递过去：刚有人说过话（安静了 1 分钟）；已记一条事件")
             self.assertTrue(any("没递过去" in line for line in ctx.logs), ctx.logs)
             self.assertEqual(len(ctx.events), 1, "没递过去也要留事件")
             self.assertEqual(drive.state.wake_count, 1)

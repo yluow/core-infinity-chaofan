@@ -39,7 +39,7 @@ from pathlib import Path
 SOURCE = "chaofan"
 
 #: 写进事件 meta。
-PLUGIN_VERSION = "0.1.7"
+PLUGIN_VERSION = "0.1.8"
 
 #: 她的名字。写死：名字是身份卡的事，不是配置栏的事（0.1.3 起不再做成一栏）。
 SELF_NAME = "炒饭智能"
@@ -577,7 +577,8 @@ class Drive:
         wire = config.get("quietHours")
         if wire is None:
             wire = _quiet_wire(config.get("quietStart", ""), config.get("quietEnd", ""))
-        self._quiet = _quiet_span(str(wire))
+        self.quiet_wire = str(wire)
+        self._quiet = _quiet_span(self.quiet_wire)
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -678,7 +679,9 @@ class Drive:
                   + ("yes" if callable(self.ctx.get("start_background_thread")) else "no"))
         self._start_ticker()
         self._log(f"{self.name} 已启动：基准 {self.config['intervalMinutes']:g} 分钟一醒，"
-                  f"每小时最多 {self.config['maxWakesPerHour']} 次")
+                  f"每小时最多 {self.config['maxWakesPerHour']} 次；"
+                  f"安静时段 {self.quiet_wire or '不设'}"
+                  f"（配置来自 {getattr(self, 'config_source', '?')}）")
 
     def _start_ticker(self):
         # daemon 只是兜底；收尾仍靠 stop() 的 join 核验
@@ -759,11 +762,29 @@ class Drive:
         return max(60.0, base * (1.0 + random.uniform(-jitter, jitter)))
 
     def _emit(self, now: float) -> bool:
-        push = self.ctx.get("push_event")
-        if not callable(push):
-            self._log("宿主没有 push_event：自主时间给不出去")
-            return False
         index = self.state.wake_count + 1
+        text = "\n".join(self._window_lines(now, index))
+
+        # 一次触发只留一份记录：递过去了就只留内部那一轮；递不过去才落一条事件，
+        # 否则经历里同一次会显示成两条。
+        note = (self._hand_over(text) if self.config.get("useHostWake", True)
+                else "配置里关了（useHostWake=false）")
+        delivered = note.startswith("递过去了")
+        if not delivered:
+            if not self._record_window(now, index, text):
+                self._log(f"这一次没递出去：{note}；事件也没记上")
+                return False
+            self._log(f"这一次没递过去：{note}（已记一条事件）")
+            note = f"{note}；已记一条事件"
+        self.state.wake_note = note
+        self._pending_dedup = ""
+        self._pushed += 1
+        self.state.wake_count = index
+        self.state.last_wake = now
+        self.state.wakes.append(now)
+        return True
+
+    def _window_lines(self, now: float, index: int) -> list[str]:
         lines = [f"（{self.name} · 自主时间 · {_clock(now)}）"]
         if self.state.last_active:
             minutes = int(max(0, now - self.state.last_active) // 60)
@@ -781,17 +802,21 @@ class Drive:
             lines.append(NUDGES[index % len(NUDGES)])
         lines.append("手边：mind_fs 翻 ／ mind_web 查 ／ mind_note 记 ／ mind_recall 翻旧笔记。"
                      "做过什么留一句（thread=true 的那句带到下一格）。")
+        return lines
 
-        # 上一次没送出去（总线忙 ／ 宿主还没接上）：沿用同一条 dedup_key 重试，
-        # 事件库里就不会留下两条重复的报到。
+    def _record_window(self, now: float, index: int, text: str) -> bool:
+        """往事件库记一条（只在递不过去 / 没开宿主那一路时才用）。"""
+        push = self.ctx.get("push_event")
+        if not callable(push):
+            self._log("宿主没有 push_event：这一格没处记")
+            return False
         key = self._pending_dedup or f"chaofan:wake:{index}:{int(now)}"
-
         draft = {
             "type": "chaofan_window",
             "ts": _iso(now),
             "source": SOURCE,
             "origin": "external",
-            "text": "\n".join(lines),
+            "text": text,
             "sender_key": "chaofan:self",
             "dedup_key": key,
             "meta": {
@@ -807,7 +832,7 @@ class Drive:
         }
         try:
             result = push(draft)
-        except Exception as exc:
+        except Exception as exc:                      # noqa: BLE001 —— 送不出去就说送不出去
             self._pending_dedup = key
             self._log(f"自主事件没送出去：{type(exc).__name__}: {_text(exc, 120)}")
             return False
@@ -825,24 +850,10 @@ class Drive:
                 result.add_done_callback(_seen)
             except Exception:
                 pass
-
-        # 递过去那一步（0.1.5）：请宿主跑一次内部那一路 —— 不写输入行、不冒她的名，
-        # 过不过闸由宿主说了算。没给 / 没过闸都说清楚，不假装递过。
-        note = self._hand_over("\n".join(lines))
-        if not note.startswith("递过去了"):
-            self._log(f"这一次没递过去：{note}")
-        self.state.wake_note = note
-        self._pending_dedup = ""
-        self._pushed += 1
-        self.state.wake_count = index
-        self.state.last_wake = now
-        self.state.wakes.append(now)
         return True
 
     def _hand_over(self, text: str) -> str:
         """把这一格交给宿主跑一轮；回一句人话（成没成、为什么）。"""
-        if not self.config.get("useHostWake", True):
-            return "配置里关了（useHostWake=false）"
         wake = self.ctx.get("request_wake")
         if not callable(wake):
             return "宿主没给 request_wake（只落记录，不往下走）"
@@ -870,7 +881,7 @@ class Drive:
             lines.append(f"下次醒来：{_clock(now + wait)}（约 {wait // 60} 分钟后）")
         lines.append(f"已醒来 {state.wake_count} 次；最近一小时内 {self._wakes_last_hour(now)} 次"
                      f"（上限 {int(self.config['maxWakesPerHour'])}）")
-        lines.append(f"安静时段：{self.config['quietHours'] or '无'}；上网：{'开' if self.config['allowWeb'] else '关'}")
+        lines.append(f"安静时段：{self.quiet_wire or '无'}；上网：{'开' if self.config['allowWeb'] else '关'}")
         lines.append(f"可翻阅：{'; '.join(str(root) for root in self.guard.roots)}")
         lines.append(f"上一次自主时间：{state.wake_note or '还没给过'}")
         soul = self._soul_lines(2)
@@ -1025,9 +1036,13 @@ class Drive:
 
 
 # ── 入口 ─────────────────────────────────────────────────────────────────
-def _load_config(package_dir: Path) -> dict:
+def _load_config(where) -> dict:
+    """读配置。`where` 可以是插件目录，也可以是配置文件本身。"""
     config = dict(DEFAULTS)
-    raw = _read_json(package_dir / "config.json", None)
+    path = Path(where)
+    if path.is_dir():
+        path = path / "config.json"
+    raw = _read_json(path, None)
     if not isinstance(raw, dict):
         raw = {}                      # 没有配置文件：全默认，下面照样把它算成一句时段
     for key, default in DEFAULTS.items():
@@ -1059,8 +1074,12 @@ def create(ctx):
     from telyincore.tools import ToolDef, ToolTag
 
     package_dir = Path(ctx.get("packageDir") or ctx.get("root") or ".")
-    config = _load_config(package_dir)
+    # 宿主把"这个 Bot 的那份 config.json"按 pluginConfigPath 递进来（控制台存的就是它）；
+    # 没有这一格才回落到插件目录里那份。
+    where = Path(ctx.get("pluginConfigPath") or (package_dir / "config.json"))
+    config = _load_config(where)
     drive = Drive(ctx, config)
+    drive.config_source = str(where)
 
     class Tools:
         def mind_status(self) -> str:
